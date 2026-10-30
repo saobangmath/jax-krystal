@@ -27,33 +27,41 @@ Exact APIs will land as the package grows; this README describes the intended di
 
 ## Status
 
-Early / scaffolding stage. APIs, install targets, and examples will be added as the core lands.
+Early scaffolding. Editable install works; tempering has minimal schedule helpers; OT modules are placeholders.
 
-## Installation (coming soon)
+## Project layout
+
+```text
+src/krystal/
+  ot/           # neural OT (placeholder)
+  tempering/    # annealing schedules
+  utils/        # shared helpers (placeholder)
+tests/          # smoke / unit tests
+```
+
+## Installation
+
+Requires Python ≥ 3.10.
 
 ```bash
-pip install krystal   # not published yet
-# or from source, once the package layout exists:
-# pip install -e .
+python -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -e ".[dev]"
+pytest
 ```
 
-## Intended usage (sketch)
+PyPI publish (`pip install krystal`) is not set up yet.
+
+## Quick start
 
 ```python
-# Illustrative — not yet implemented
-import jax.numpy as jnp
 import krystal as kt
 
-# Tempered path between measures
-schedule = kt.tempering.geometric(T=32)
-
-# Neural OT model trained along the tempered bridge
-model = kt.ot.NeuralMap(...)
-state = kt.train(model, source, target, schedule=schedule)
-
-# Transport / sample at a chosen temperature
-x1 = kt.transport(state, x0, t=1.0)
+schedule = kt.tempering.geometric(32, start=1.0, end=1e-3)
+# linear schedule also available: kt.tempering.linear(32)
 ```
+
+Neural OT maps and tempered training loops will land in later iterations.
 
 ## Design principles
 
@@ -63,7 +71,7 @@ x1 = kt.transport(state, x0, t=1.0)
 
 ## Roadmap (high level)
 
-1. Project layout, dependencies, and typing
+1. Project layout, dependencies, and typing ← *in progress*
 2. Core tempering schedules and path utilities
 3. Neural OT building blocks (maps / losses)
 4. Joint training loops with tempered bridges
@@ -75,8 +83,8 @@ If you use this work in research, a citation entry will be added here once a pap
 
 ## License
 
-TBD.
+MIT — see [LICENSE](LICENSE).
 
 ## Contributing
 
-Issues and ideas welcome once the initial package skeleton is in place.
+Issues and ideas welcome. Keep changes small so we can iterate on the structure safely.
