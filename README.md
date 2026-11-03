@@ -18,7 +18,7 @@ Optimal transport (OT) gives a principled way to move mass between probability m
 
 | Area | Focus |
 |------|--------|
-| **Neural OT** | Learned maps / potentials / couplings in JAX (Flax / Equinox-friendly) |
+| **Transport / Neural OT** | Learned maps / potentials / couplings in JAX (Flax / Equinox-friendly) |
 | **Tempering** | Temperature / geometric / annealing schedules for training & sampling |
 | **Bridges** | Tempered OT paths between source ↔ target |
 | **Accelerators** | Pure JAX: composable transforms, reproducible PRNG, GPU/TPU ready |
@@ -27,13 +27,13 @@ Exact APIs will land as the package grows; this README describes the intended di
 
 ## Status
 
-Early scaffolding. Editable install works; tempering has minimal schedule helpers; OT modules are placeholders.
+Early scaffolding. Editable install works; tempering has minimal schedule helpers; transport has a NICE flow and map protocol.
 
 ## Project layout
 
 ```text
 src/krystal/
-  ot/           # neural OT (placeholder)
+  transport/    # maps / flows / OT building blocks
   tempering/    # annealing schedules
   utils/        # shared helpers (placeholder)
 tests/          # smoke / unit tests
@@ -73,7 +73,7 @@ Neural OT maps and tempered training loops will land in later iterations.
 
 1. Project layout, dependencies, and typing ← *in progress*
 2. Core tempering schedules and path utilities
-3. Neural OT building blocks (maps / losses)
+3. Transport / neural OT building blocks (maps / losses)
 4. Joint training loops with tempered bridges
 5. Tutorials and benchmarks
 
