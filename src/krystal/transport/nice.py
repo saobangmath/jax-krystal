@@ -46,7 +46,7 @@ def _split_index(dim: int) -> int:
     return dim // 2
 
 
-@dataclass(frozen=True)
+@dataclass
 class NICE:
     """Stack of additive coupling layers (NICE).
 
