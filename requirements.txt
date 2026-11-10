@@ -1,0 +1,13 @@
+# Core (aligned with pyproject.toml)
+jax>=0.4.30
+jaxlib>=0.4.30
+optax>=0.2.3
+
+# Experiments / notebooks (examples/bimodal_st.ipynb)
+matplotlib>=3.8
+jupyter>=1.0
+ipykernel>=6.0
+
+# Dev
+pytest>=8.0
+ruff>=0.6

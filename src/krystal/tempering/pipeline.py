@@ -1,16 +1,54 @@
-"""CRAFT-style tempering pipeline: learn flow → implement → tune λ.
+"""CRAFT-style tempering pipeline for Simulated Tempering.
 
-Outer loop (scaffold only — stage bodies land later):
+Outer loop order:
 
-1. **Learn flow** — fit maps ``φ_{i→i+1}`` between neighboring levels.
-2. **Implement** — propose ``y = φ(x)`` and accept/reject level moves.
-3. **Tune weight** — update ladder weights ``λ``.
+1. **Implement** — run ST with current flows; collect level occupancy.
+2. **Tune weight** — update ladder weights ``λ`` from occupancy.
+3. **Learn flow** — fit ``φ_{i→i+1}`` on the current particle snapshot.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
 from typing import Any
+
+import jax.numpy as jnp
+import optax
+from jax import Array, grad, random
+
+from krystal.transport.base import Transformation
+
+_DEFAULT_OUTER_ITERATIONS = 10_000
+_DEFAULT_INNER_SWEEPS = 10_000
+
+LogProbFn = Callable[[int, Array], Array]
+
+
+@dataclass
+class PipelineState:
+    """Ensemble + flow / weight parameters for one Pipeline."""
+
+    x: Array
+    """Particle configurations, shape ``(n_particles, dim)``."""
+
+    levels: Array
+    """Integer ladder index per particle, shape ``(n_particles,)``."""
+
+    flow_params: list[Any]
+    """Parameters for each edge ``i → i+1`` (length ``n_levels - 1``)."""
+
+    log_lambda: Array
+    """Log tempering weights, shape ``(n_levels,)``."""
+
+    key: Array
+    """PRNG key."""
+
+    opt_states: list[Any]
+    """Optax state per edge."""
+
+    counts: Array
+    """Visit counts from the last ``implement`` call, shape ``(n_levels,)``."""
 
 
 @dataclass
@@ -20,32 +58,225 @@ class Pipeline:
     Parameters
     ----------
     n_levels:
-        Number of tempered levels ``0, ..., T`` (``T = n_levels - 1``).
+        Number of annealing distributions ``0, ..., n_levels - 1``.
+    flow:
+        Invertible map with ``init`` / ``forward`` / ``inverse`` (e.g. ``NICE``).
+    log_prob:
+        ``log_prob(level, x) -> Array`` unnormalized log-density for level
+        ``level``. ``x`` may be batched ``(n, dim)``; return shape ``(n,)``.
+    n_inner:
+        ST sweeps inside each ``implement`` call.
+    n_local:
+        Random-walk MH steps within the current level per particle per sweep.
+    local_step_size:
+        Proposal std for within-level random-walk MH.
+    lr:
+        Adam learning rate for ``learn_flow``.
+    learn_steps:
+        Gradient steps per edge per ``learn_flow`` call.
+    eta:
+        Damping for ``log λ`` updates from occupancy.
     """
 
     n_levels: int
+    flow: Transformation
+    log_prob: LogProbFn
+    n_inner: int = _DEFAULT_INNER_SWEEPS
+    n_local: int = 1
+    local_step_size: float = 0.5
+    lr: float = 1e-3
+    learn_steps: int = 1
+    eta: float = 1.0
+    flows: tuple[Transformation, ...] = field(init=False)
+    _optimizer: optax.GradientTransformation = field(init=False, repr=False)
 
-    def learn_flow(self, state: Any) -> Any:
-        """Train transport maps between consecutive tempered levels."""
-        raise NotImplementedError
+    def __post_init__(self) -> None:
+        if self.n_levels < 2:
+            raise ValueError("n_levels must be >= 2 (need at least one consecutive pair)")
+        if self.n_inner < 1:
+            raise ValueError("n_inner must be >= 1")
+        if self.learn_steps < 1:
+            raise ValueError("learn_steps must be >= 1")
+        self.flows = tuple(self.flow for _ in range(self.n_levels - 1))
+        self._optimizer = optax.adam(self.lr)
 
-    def implement(self, state: Any) -> Any:
-        """Apply learned maps to propose and accept/reject transitions."""
-        raise NotImplementedError
+    @property
+    def n_edges(self) -> int:
+        """Number of consecutive bridges ``i → i+1``."""
+        return self.n_levels - 1
 
-    def tune_weight(self, state: Any) -> Any:
-        """Update tempering weights ``λ`` from the current run."""
-        raise NotImplementedError
+    def init_state(self, key: Array, x0: Array) -> PipelineState:
+        """Bootstrap state: particles at level 0 from easy samples ``x0``."""
+        if x0.ndim != 2:
+            raise ValueError("x0 must have shape (n_particles, dim)")
+        n_particles = x0.shape[0]
+        keys = random.split(key, self.n_edges + 1)
+        flow_params = [
+            self.flow.init(keys[i])  # type: ignore[attr-defined]
+            for i in range(self.n_edges)
+        ]
+        opt_states = [self._optimizer.init(p) for p in flow_params]
+        return PipelineState(
+            x=x0,
+            levels=jnp.zeros(n_particles, dtype=jnp.int32),
+            flow_params=flow_params,
+            log_lambda=jnp.zeros(self.n_levels),
+            key=keys[-1],
+            opt_states=opt_states,
+            counts=jnp.zeros(self.n_levels, dtype=jnp.int32),
+        )
 
-    def step(self, state: Any) -> Any:
-        """One outer iteration: learn flow → implement → tune weight."""
-        state = self.learn_flow(state)
+    def _local_mh(
+        self,
+        key: Array,
+        x: Array,
+        level: int,
+    ) -> tuple[Array, Array]:
+        """Random-walk MH targeting ``π_level`` at fixed ladder index."""
+        for _ in range(self.n_local):
+            key, prop_key, u_key = random.split(key, 3)
+            prop = x + self.local_step_size * random.normal(prop_key, x.shape)
+            log_alpha = (
+                self.log_prob(level, prop[None, :])[0]
+                - self.log_prob(level, x[None, :])[0]
+            )
+            if jnp.log(random.uniform(u_key)) < log_alpha:
+                x = prop
+        return key, x
+
+    def _mh_level_move(
+        self,
+        key: Array,
+        x: Array,
+        level: int,
+        proposed: int,
+        flow_params: list[Any],
+        log_lambda: Array,
+    ) -> tuple[Array, Array, int]:
+        """Single-particle MH move between neighboring levels."""
+        if proposed == level:
+            return key, x, level
+
+        if proposed == level + 1:
+            edge = level
+            params = flow_params[edge]
+            y, log_det = self.flow.forward(params, x[None, :])
+            y = y[0]
+            log_det = log_det[0]
+            log_alpha = (
+                log_lambda[proposed]
+                + self.log_prob(proposed, y[None, :])[0]
+                - log_lambda[level]
+                - self.log_prob(level, x[None, :])[0]
+                + log_det
+            )
+        elif proposed == level - 1:
+            edge = proposed
+            params = flow_params[edge]
+            y, log_det = self.flow.inverse(params, x[None, :])
+            y = y[0]
+            log_det = log_det[0]
+            log_alpha = (
+                log_lambda[proposed]
+                + self.log_prob(proposed, y[None, :])[0]
+                - log_lambda[level]
+                - self.log_prob(level, x[None, :])[0]
+                + log_det
+            )
+        else:
+            return key, x, level
+
+        key, u_key = random.split(key)
+        if jnp.log(random.uniform(u_key)) < log_alpha:
+            return key, y, proposed
+        return key, x, level
+
+    def implement(self, state: PipelineState) -> PipelineState:
+        """Run ST with frozen flows; accumulate level occupancy."""
+        x = state.x
+        levels = state.levels
+        key = state.key
+        counts = jnp.zeros(self.n_levels, dtype=jnp.int32)
+        n_particles = int(x.shape[0])
+        max_level = self.n_levels - 1
+
+        for _ in range(self.n_inner):
+            for p in range(n_particles):
+                level = int(levels[p])
+                key, new_x = self._local_mh(key, x[p], level)
+                x = x.at[p].set(new_x)
+
+                key, dir_key = random.split(key)
+                direction = 1 if bool(random.bernoulli(dir_key)) else -1
+                proposed = int(jnp.clip(level + direction, 0, max_level))
+                key, new_x, new_level = self._mh_level_move(
+                    key,
+                    x[p],
+                    level,
+                    proposed,
+                    state.flow_params,
+                    state.log_lambda,
+                )
+                x = x.at[p].set(new_x)
+                levels = levels.at[p].set(new_level)
+            counts = counts + jnp.bincount(levels, length=self.n_levels)
+
+        return replace(state, x=x, levels=levels, key=key, counts=counts)
+
+    def tune_weight(self, state: PipelineState) -> PipelineState:
+        """Update ``log λ`` from occupancy counts collected in ``implement``."""
+        counts = state.counts.astype(state.log_lambda.dtype)
+        # Pseudocounts avoid log(0) when a level was never visited.
+        weights = counts + 1e-3
+        frac = weights / jnp.sum(weights)
+        log_lambda = state.log_lambda - self.eta * jnp.log(frac)
+        log_lambda = log_lambda - jnp.mean(log_lambda)
+        return replace(state, log_lambda=log_lambda)
+
+    def learn_flow(self, state: PipelineState) -> PipelineState:
+        """Fit each edge flow with reverse KL on particles at the source level."""
+        flow_params = list(state.flow_params)
+        opt_states = list(state.opt_states)
+        levels_np = state.levels
+
+        for edge in range(self.n_edges):
+            mask = levels_np == edge
+            if not bool(jnp.any(mask)):
+                continue
+            x_batch = state.x[mask]
+            params = flow_params[edge]
+            opt_state = opt_states[edge]
+
+            def loss_fn(p: Any, batch: Array = x_batch, e: int = edge) -> Array:
+                y, log_det = self.flow.forward(p, batch)
+                return jnp.mean(
+                    self.log_prob(e, batch) - self.log_prob(e + 1, y) - log_det
+                )
+
+            for _ in range(self.learn_steps):
+                grads = grad(loss_fn)(params)
+                updates, opt_state = self._optimizer.update(grads, opt_state, params)
+                params = optax.apply_updates(params, updates)
+
+            flow_params[edge] = params
+            opt_states[edge] = opt_state
+
+        return replace(state, flow_params=flow_params, opt_states=opt_states)
+
+    def step(self, state: PipelineState) -> PipelineState:
+        """One outer iteration: implement → tune weight → learn flow."""
         state = self.implement(state)
         state = self.tune_weight(state)
+        state = self.learn_flow(state)
         return state
 
-    def run(self, state: Any, *, n_iterations: int) -> Any:
-        """Repeat ``step`` for ``n_iterations``."""
+    def run(
+        self,
+        state: PipelineState,
+        *,
+        n_iterations: int = _DEFAULT_OUTER_ITERATIONS,
+    ) -> PipelineState:
+        """Repeat ``step`` for ``n_iterations`` (default 10_000)."""
         if n_iterations < 0:
             raise ValueError("n_iterations must be >= 0")
         for _ in range(n_iterations):
