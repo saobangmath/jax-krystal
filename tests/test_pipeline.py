@@ -109,5 +109,5 @@ def test_step_and_short_run_smoke():
     state = pipe.init_state(random.PRNGKey(1), random.normal(key, (8, 2)))
     state = pipe.step(state)
     assert state.counts.sum() > 0
-    state = pipe.run(state, n_iterations=2)
+    state = pipe.run(state, n_iterations=2, progress=False)
     assert state.x.shape == (8, 2)

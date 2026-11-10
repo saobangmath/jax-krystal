@@ -30,6 +30,7 @@ dependencies = [
   "jax>=0.4.30",
   "jaxlib>=0.4.30",
   "optax>=0.2.3",
+  "tqdm>=4.66",
 ]
 
 [project.optional-dependencies]

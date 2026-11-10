@@ -16,6 +16,7 @@ from typing import Any
 import jax.numpy as jnp
 import optax
 from jax import Array, grad, random
+from tqdm.auto import tqdm
 
 from krystal.transport.base import Transformation
 
@@ -191,7 +192,12 @@ class Pipeline:
             return key, y, proposed
         return key, x, level
 
-    def implement(self, state: PipelineState) -> PipelineState:
+    def implement(
+        self,
+        state: PipelineState,
+        *,
+        progress: bool = False,
+    ) -> PipelineState:
         """Run ST with frozen flows; accumulate level occupancy."""
         x = state.x
         levels = state.levels
@@ -200,7 +206,11 @@ class Pipeline:
         n_particles = int(x.shape[0])
         max_level = self.n_levels - 1
 
-        for _ in range(self.n_inner):
+        sweeps = range(self.n_inner)
+        if progress:
+            sweeps = tqdm(sweeps, desc="implement (ST)", leave=False)
+
+        for _ in sweeps:
             for p in range(n_particles):
                 level = int(levels[p])
                 key, new_x = self._local_mh(key, x[p], level)
@@ -233,13 +243,22 @@ class Pipeline:
         log_lambda = log_lambda - jnp.mean(log_lambda)
         return replace(state, log_lambda=log_lambda)
 
-    def learn_flow(self, state: PipelineState) -> PipelineState:
+    def learn_flow(
+        self,
+        state: PipelineState,
+        *,
+        progress: bool = False,
+    ) -> PipelineState:
         """Fit each edge flow with reverse KL on particles at the source level."""
         flow_params = list(state.flow_params)
         opt_states = list(state.opt_states)
         levels_np = state.levels
 
-        for edge in range(self.n_edges):
+        edges = range(self.n_edges)
+        if progress:
+            edges = tqdm(edges, desc="learn_flow", leave=False)
+
+        for edge in edges:
             mask = levels_np == edge
             if not bool(jnp.any(mask)):
                 continue
@@ -263,11 +282,16 @@ class Pipeline:
 
         return replace(state, flow_params=flow_params, opt_states=opt_states)
 
-    def step(self, state: PipelineState) -> PipelineState:
+    def step(
+        self,
+        state: PipelineState,
+        *,
+        progress: bool = False,
+    ) -> PipelineState:
         """One outer iteration: implement → tune weight → learn flow."""
-        state = self.implement(state)
+        state = self.implement(state, progress=progress)
         state = self.tune_weight(state)
-        state = self.learn_flow(state)
+        state = self.learn_flow(state, progress=progress)
         return state
 
     def run(
@@ -275,10 +299,15 @@ class Pipeline:
         state: PipelineState,
         *,
         n_iterations: int = _DEFAULT_OUTER_ITERATIONS,
+        progress: bool = True,
     ) -> PipelineState:
         """Repeat ``step`` for ``n_iterations`` (default 10_000)."""
         if n_iterations < 0:
             raise ValueError("n_iterations must be >= 0")
-        for _ in range(n_iterations):
-            state = self.step(state)
+        steps = range(n_iterations)
+        if progress:
+            steps = tqdm(steps, desc="train (outer)")
+        for _ in steps:
+            # Nested bars off: outer bar is enough during ``run``.
+            state = self.step(state, progress=False)
         return state
