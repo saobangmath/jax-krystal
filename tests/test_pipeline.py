@@ -1,5 +1,6 @@
 """Pipeline: ladder wiring and CRAFT-ST stage smoke tests."""
 
+import jax
 import jax.numpy as jnp
 import pytest
 from jax import random
@@ -96,11 +97,11 @@ def test_learn_flow_runs_when_particles_at_level_zero():
     pipe = _tiny_pipeline(n_inner=2, learn_steps=2)
     key = random.PRNGKey(0)
     state = pipe.init_state(random.PRNGKey(1), random.normal(key, (16, 2)))
-    # All at level 0 → edge 0 should update.
-    w0_before = state.flow_params[0][0][0][0]
+    # All at level 0 → edge 0 should update (Flax params pytree).
+    leaf_before = jax.tree_util.tree_leaves(state.flow_params[0])[0]
     state = pipe.learn_flow(state)
-    w0_after = state.flow_params[0][0][0][0]
-    assert not jnp.allclose(w0_before, w0_after)
+    leaf_after = jax.tree_util.tree_leaves(state.flow_params[0])[0]
+    assert not jnp.allclose(leaf_before, leaf_after)
 
 
 def test_step_and_short_run_smoke():

@@ -1,43 +1,17 @@
 """NICE: Nonlinear Independent Components Estimation (Dinh et al., 2014).
 
 Additive coupling layers are volume-preserving, so ``log|det J| = 0``.
-That keeps MH corrections simple while wiring flows into simulated tempering.
+Implemented with Flax ``nn.Module``; the public ``NICE`` wrapper keeps the
+``Transformation`` API (``init`` / ``forward`` / ``inverse`` + params pytree).
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import jax.numpy as jnp
-from jax import Array, random
-
-
-def _mlp_init(
-    key: Array,
-    in_dim: int,
-    out_dim: int,
-    hidden_dims: Sequence[int],
-) -> list[tuple[Array, Array]]:
-    """Initialize an MLP as a list of ``(weight, bias)``."""
-    dims = [in_dim, *hidden_dims, out_dim]
-    params: list[tuple[Array, Array]] = []
-    keys = random.split(key, len(dims) - 1)
-    for k, din, dout in zip(keys, dims[:-1], dims[1:], strict=True):
-        # Glorot-style scaling for tanh networks
-        limit = jnp.sqrt(6.0 / (din + dout))
-        w = random.uniform(k, (din, dout), minval=-limit, maxval=limit)
-        b = jnp.zeros((dout,))
-        params.append((w, b))
-    return params
-
-
-def _mlp_apply(params: Sequence[tuple[Array, Array]], x: Array) -> Array:
-    h = x
-    for w, b in params[:-1]:
-        h = jnp.tanh(h @ w + b)
-    w, b = params[-1]
-    return h @ w + b
+from flax import linen as nn
+from jax import Array
 
 
 def _split_index(dim: int) -> int:
@@ -46,62 +20,96 @@ def _split_index(dim: int) -> int:
     return dim // 2
 
 
-@dataclass
-class NICE:
-    """Stack of additive coupling layers (NICE).
+class CouplingMLP(nn.Module):
+    """MLP used inside one additive coupling (tanh + Xavier)."""
 
-    Even layers transform the second half given the first; odd layers do the
-    reverse split — the usual alternating partition.
-    """
+    hidden_dims: tuple[int, ...]
+    out_dim: int
+
+    @nn.compact
+    def __call__(self, x: Array) -> Array:
+        kernel_init = nn.initializers.xavier_uniform()
+        for width in self.hidden_dims:
+            x = nn.Dense(width, kernel_init=kernel_init)(x)
+            x = nn.tanh(x)
+        return nn.Dense(self.out_dim, kernel_init=kernel_init)(x)
+
+
+class NICEModule(nn.Module):
+    """Flax NICE stack: forward is ``__call__``, reverse is ``inverse``."""
 
     dim: int
     n_layers: int = 4
     hidden_dims: tuple[int, ...] = (64, 64)
 
-    def init(self, key: Array) -> list[list[tuple[Array, Array]]]:
-        """Sample parameters for every coupling network ``m``."""
+    def setup(self) -> None:
         split = _split_index(self.dim)
-        # Even layers: m(first) -> second half; odd: m(second) -> first half
-        in_out = [
-            (split, self.dim - split) if layer % 2 == 0 else (self.dim - split, split)
-            for layer in range(self.n_layers)
-        ]
-        keys = random.split(key, self.n_layers)
-        return [
-            _mlp_init(k, din, dout, self.hidden_dims)
-            for k, (din, dout) in zip(keys, in_out, strict=True)
-        ]
+        mlps: list[CouplingMLP] = []
+        for layer in range(self.n_layers):
+            if layer % 2 == 0:
+                out_dim = self.dim - split
+            else:
+                out_dim = split
+            mlps.append(CouplingMLP(self.hidden_dims, out_dim))
+        self.mlps = mlps
 
-    def forward(self, params: object, x: Array) -> tuple[Array, Array]:
-        layers = params
-        assert isinstance(layers, list)
+    def __call__(self, x: Array) -> tuple[Array, Array]:
         split = _split_index(self.dim)
         z = x
-        for layer_idx, m_params in enumerate(layers):
+        for layer_idx, mlp in enumerate(self.mlps):
+            a, b = z[..., :split], z[..., split:]
             if layer_idx % 2 == 0:
-                a, b = z[..., :split], z[..., split:]
-                b = b + _mlp_apply(m_params, a)
-                z = jnp.concatenate([a, b], axis=-1)
+                b = b + mlp(a)
             else:
-                a, b = z[..., :split], z[..., split:]
-                a = a + _mlp_apply(m_params, b)
-                z = jnp.concatenate([a, b], axis=-1)
+                a = a + mlp(b)
+            z = jnp.concatenate([a, b], axis=-1)
         log_det = jnp.zeros(x.shape[:-1], dtype=x.dtype)
         return z, log_det
 
-    def inverse(self, params: object, y: Array) -> tuple[Array, Array]:
-        layers = params
-        assert isinstance(layers, list)
+    def inverse(self, y: Array) -> tuple[Array, Array]:
         split = _split_index(self.dim)
         z = y
-        for layer_idx, m_params in reversed(list(enumerate(layers))):
+        for layer_idx in reversed(range(self.n_layers)):
+            mlp = self.mlps[layer_idx]
+            a, b = z[..., :split], z[..., split:]
             if layer_idx % 2 == 0:
-                a, b = z[..., :split], z[..., split:]
-                b = b - _mlp_apply(m_params, a)
-                z = jnp.concatenate([a, b], axis=-1)
+                b = b - mlp(a)
             else:
-                a, b = z[..., :split], z[..., split:]
-                a = a - _mlp_apply(m_params, b)
-                z = jnp.concatenate([a, b], axis=-1)
+                a = a - mlp(b)
+            z = jnp.concatenate([a, b], axis=-1)
         log_det = jnp.zeros(y.shape[:-1], dtype=y.dtype)
         return z, log_det
+
+
+@dataclass
+class NICE:
+    """Transformation-facing wrapper around :class:`NICEModule`.
+
+    ``NICE`` is the architecture config; Flax params are a separate pytree
+    from :meth:`init`, passed into :meth:`forward` / :meth:`inverse`.
+    """
+
+    dim: int
+    n_layers: int = 4
+    hidden_dims: tuple[int, ...] = (64, 64)
+    _module: NICEModule = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._module = NICEModule(
+            dim=self.dim,
+            n_layers=self.n_layers,
+            hidden_dims=self.hidden_dims,
+        )
+
+    def init(self, key: Array) -> object:
+        """Initialize Flax params (dummy batch of shape ``(1, dim)``)."""
+        dummy = jnp.zeros((1, self.dim))
+        return self._module.init(key, dummy)["params"]
+
+    def forward(self, params: object, x: Array) -> tuple[Array, Array]:
+        """Map ``x → y``; returns ``(y, log|det J|)`` with ``log|det J| = 0``."""
+        return self._module.apply({"params": params}, x)
+
+    def inverse(self, params: object, y: Array) -> tuple[Array, Array]:
+        """Map ``y → x`` via the exact inverse coupling."""
+        return self._module.apply({"params": params}, y, method=self._module.inverse)
