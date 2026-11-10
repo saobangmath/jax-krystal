@@ -18,10 +18,17 @@ import optax
 from jax import Array, grad, random
 from tqdm.auto import tqdm
 
+from krystal.tempering.constants import (
+    DEFAULT_ETA,
+    DEFAULT_INNER_SWEEPS,
+    DEFAULT_LEARN_STEPS,
+    DEFAULT_LEARNING_RATE,
+    DEFAULT_LOCAL_STEP_SIZE,
+    DEFAULT_N_LOCAL,
+    DEFAULT_OUTER_ITERATIONS,
+    OCCUPANCY_PSEUDOCOUNT,
+)
 from krystal.transport.base import Transformation
-
-_DEFAULT_OUTER_ITERATIONS = 10_000
-_DEFAULT_INNER_SWEEPS = 10_000
 
 LogProbFn = Callable[[int, Array], Array]
 
@@ -82,12 +89,12 @@ class Pipeline:
     n_levels: int
     flow: Transformation
     log_prob: LogProbFn
-    n_inner: int = _DEFAULT_INNER_SWEEPS
-    n_local: int = 1
-    local_step_size: float = 0.5
-    lr: float = 1e-3
-    learn_steps: int = 1
-    eta: float = 1.0
+    n_inner: int = DEFAULT_INNER_SWEEPS
+    n_local: int = DEFAULT_N_LOCAL
+    local_step_size: float = DEFAULT_LOCAL_STEP_SIZE
+    lr: float = DEFAULT_LEARNING_RATE
+    learn_steps: int = DEFAULT_LEARN_STEPS
+    eta: float = DEFAULT_ETA
     flows: tuple[Transformation, ...] = field(init=False)
     _optimizer: optax.GradientTransformation = field(init=False, repr=False)
 
@@ -237,7 +244,7 @@ class Pipeline:
         """Update ``log λ`` from occupancy counts collected in ``implement``."""
         counts = state.counts.astype(state.log_lambda.dtype)
         # Pseudocounts avoid log(0) when a level was never visited.
-        weights = counts + 1e-3
+        weights = counts + OCCUPANCY_PSEUDOCOUNT
         frac = weights / jnp.sum(weights)
         log_lambda = state.log_lambda - self.eta * jnp.log(frac)
         log_lambda = log_lambda - jnp.mean(log_lambda)
@@ -298,7 +305,7 @@ class Pipeline:
         self,
         state: PipelineState,
         *,
-        n_iterations: int = _DEFAULT_OUTER_ITERATIONS,
+        n_iterations: int = DEFAULT_OUTER_ITERATIONS,
         progress: bool = True,
     ) -> PipelineState:
         """Repeat ``step`` for ``n_iterations`` (default 10_000)."""
