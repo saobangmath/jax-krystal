@@ -27,6 +27,7 @@ from krystal.tempering.constants import (
     DEFAULT_N_LOCAL,
     DEFAULT_OUTER_ITERATIONS,
     OCCUPANCY_PSEUDOCOUNT,
+    RW_MH_OPTIMAL_SCALE,
 )
 from krystal.transport.base import Transformation
 
@@ -77,7 +78,8 @@ class Pipeline:
     n_local:
         Random-walk MH steps within the current level per particle per sweep.
     local_step_size:
-        Proposal std for within-level random-walk MH.
+        Multiplier on the Gelman isotropic scale ``2.38 / sqrt(d)``
+        (proposal variance ``(2.38² / d) I`` when this is ``1.0``).
     lr:
         Adam learning rate for ``learn_flow``.
     learn_steps:
@@ -140,10 +142,17 @@ class Pipeline:
         x: Array,
         level: int,
     ) -> tuple[Array, Array]:
-        """Random-walk MH targeting ``π_level`` at fixed ladder index."""
+        """Random-walk MH targeting ``π_level`` at fixed ladder index.
+
+        Proposal: ``x' = x + σ ε``, ``ε ~ N(0, I)``, with
+        ``σ = local_step_size * 2.38 / sqrt(d)`` so that the default
+        (``local_step_size=1``) has variance ``2.38² / d`` per coordinate.
+        """
+        dim = x.shape[-1]
+        step = self.local_step_size * RW_MH_OPTIMAL_SCALE / jnp.sqrt(dim)
         for _ in range(self.n_local):
             key, prop_key, u_key = random.split(key, 3)
-            prop = x + self.local_step_size * random.normal(prop_key, x.shape)
+            prop = x + step * random.normal(prop_key, x.shape)
             log_alpha = (
                 self.log_prob(level, prop[None, :])[0]
                 - self.log_prob(level, x[None, :])[0]
