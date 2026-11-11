@@ -67,6 +67,8 @@ def test_init_state_at_level_zero():
     assert jnp.all(state.levels == 0)
     assert len(state.flow_params) == pipe.n_edges
     assert state.log_lambda.shape == (pipe.n_levels,)
+    assert state.local_cov.shape == (pipe.n_levels, 2, 2)
+    assert jnp.allclose(state.local_cov[0], jnp.eye(2))
 
 
 def test_implement_updates_counts_and_preserves_shape():
@@ -134,3 +136,21 @@ def test_implement_replicas_parallel_collect():
     assert jnp.all((levels >= 0) & (levels < pipe.n_levels))
     # Shared start + different keys → not all replicas identical.
     assert not jnp.allclose(xs[0], xs[1])
+
+
+def test_update_local_cov_estimates_correlation():
+    pipe = _tiny_pipeline(n_inner=2)
+    key = random.PRNGKey(0)
+    # Correlated cloud all at level 0: x1 ≈ x0.
+    z = random.normal(key, (64, 1))
+    x0 = jnp.concatenate([z, z], axis=-1)
+    state = pipe.init_state(random.PRNGKey(1), x0)
+    state = pipe.update_local_cov(state)
+    cov0 = state.local_cov[0]
+    # Off-diagonal should be clearly positive (near 1 for this cloud).
+    assert cov0[0, 1] > 0.5
+    # Empty levels stay I.
+    assert jnp.allclose(state.local_cov[1], jnp.eye(2), atol=1e-5)
+    # Non-identity Σ still runs implement.
+    state = pipe.implement(state)
+    assert state.x.shape == (64, 2)

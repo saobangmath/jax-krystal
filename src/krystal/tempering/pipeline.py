@@ -32,6 +32,8 @@ from krystal.tempering.constants import (
     DEFAULT_LOCAL_STEP_SIZE,
     DEFAULT_N_LOCAL,
     DEFAULT_OUTER_ITERATIONS,
+    LOCAL_COV_MIN_POINTS,
+    LOCAL_COV_RIDGE,
     OCCUPANCY_PSEUDOCOUNT,
     RW_MH_OPTIMAL_SCALE,
 )
@@ -66,6 +68,13 @@ class PipelineState:
     counts: Array
     """Visit counts from the last ``implement`` call, shape ``(n_levels,)``."""
 
+    local_cov: Array
+    """Per-level RW proposal covariance ``Σ``, shape ``(n_levels, dim, dim)``.
+
+    Gelman proposal is ``N(x, (2.38² / d) Σ)``. Starts as ``I``; refresh with
+    :meth:`Pipeline.update_local_cov` after particles have mixed.
+    """
+
     def tree_flatten(self):
         children = (
             self.x,
@@ -75,6 +84,7 @@ class PipelineState:
             self.key,
             self.opt_states,
             self.counts,
+            self.local_cov,
         )
         return children, None
 
@@ -103,8 +113,9 @@ class Pipeline:
     n_local:
         Random-walk MH steps within the current level per particle per sweep.
     local_step_size:
-        Multiplier on the Gelman isotropic scale ``2.38 / sqrt(d)``
-        (proposal variance ``(2.38² / d) I`` when this is ``1.0``).
+        Multiplier on the Gelman factor ``2.38 / sqrt(d)``. With per-level
+        covariance ``Σ`` on :class:`PipelineState`, the proposal is
+        ``N(x, (2.38² / d) Σ)`` (``Σ = I`` until ``update_local_cov``).
     lr:
         Adam learning rate for ``learn_flow``.
     learn_steps:
@@ -151,6 +162,10 @@ class Pipeline:
             for i in range(self.n_edges)
         ]
         opt_states = [self._optimizer.init(p) for p in flow_params]
+        dim = x0.shape[1]
+        local_cov = jnp.broadcast_to(
+            jnp.eye(dim, dtype=x0.dtype), (self.n_levels, dim, dim)
+        ).copy()
         return PipelineState(
             x=x0,
             levels=jnp.zeros(n_particles, dtype=jnp.int32),
@@ -159,6 +174,7 @@ class Pipeline:
             key=keys[-1],
             opt_states=opt_states,
             counts=jnp.zeros(self.n_levels, dtype=jnp.int32),
+            local_cov=local_cov,
         )
 
     def _stack_flow_params(self, flow_params: list[Any]) -> Any:
@@ -170,17 +186,25 @@ class Pipeline:
         key: Key,
         x: Array,
         level: Array,
+        cov_chols: Array,
     ) -> tuple[Key, Array]:
-        """RW-MH at fixed ladder index (single particle; ``vmap``-friendly)."""
+        """RW-MH at fixed ladder index (single particle; ``vmap``-friendly).
+
+        Proposal: ``x' = x + (s · 2.38 / √d) · L_level ε`` with ``ε ~ N(0, I)``
+        and ``Σ_level = L_level L_levelᵀ``, i.e. ``N(x, (2.38² / d) Σ_level)``
+        when ``s = local_step_size``.
+        """
         dim = x.shape[-1]
-        step = self.local_step_size * RW_MH_OPTIMAL_SCALE / jnp.sqrt(dim)
+        scale = self.local_step_size * RW_MH_OPTIMAL_SCALE / jnp.sqrt(dim)
+        L = cov_chols[level]
         log_prob = self.log_prob
         n_local = self.n_local
 
         def body(carry, _):
             key, x = carry
             key, prop_key, u_key = random.split(key, 3)
-            prop = x + step * random.normal(prop_key, x.shape)
+            eps = random.normal(prop_key, x.shape)
+            prop = x + scale * (L @ eps)
             log_alpha = log_prob(level, prop[None, :])[0] - log_prob(level, x[None, :])[0]
             accept = jnp.log(random.uniform(u_key)) < log_alpha
             x = jnp.where(accept, prop, x)
@@ -232,14 +256,20 @@ class Pipeline:
         new_level = jnp.where(accept, proposed, level)
         return key, new_x, new_level
 
-    def _make_sweep(self, stacked_params: Any, log_lambda: Array, n_particles: int):
+    def _make_sweep(
+        self,
+        stacked_params: Any,
+        log_lambda: Array,
+        cov_chols: Array,
+        n_particles: int,
+    ):
         """Build one ST sweep: ``vmap`` local explore + jump over particles."""
         n_levels = self.n_levels
         local_explore = self._local_explore
         jump_ladder = self._jump_ladder
 
         def one_particle(p_key: Key, x: Array, level: Array):
-            p_key, x = local_explore(p_key, x, level)
+            p_key, x = local_explore(p_key, x, level, cov_chols)
             p_key, x, level = jump_ladder(p_key, x, level, stacked_params, log_lambda)
             return p_key, x, level
 
@@ -260,14 +290,16 @@ class Pipeline:
         levels: Array,
         flow_params: list[Any],
         log_lambda: Array,
+        local_cov: Array,
         *,
         n_inner: int | None = None,
     ) -> tuple[Key, Array, Array, Array]:
         """Pure ST: ``scan`` over sweeps. Returns ``(key, x, levels, counts)``."""
         n_inner = self.n_inner if n_inner is None else n_inner
         stacked = self._stack_flow_params(flow_params)
+        cov_chols = jnp.linalg.cholesky(local_cov)
         n_particles = int(x.shape[0])
-        sweep = self._make_sweep(stacked, log_lambda, n_particles)
+        sweep = self._make_sweep(stacked, log_lambda, cov_chols, n_particles)
         (key, x, levels), deltas = lax.scan(
             sweep, (key, x, levels), None, length=n_inner
         )
@@ -282,8 +314,9 @@ class Pipeline:
     ) -> PipelineState:
         """Run ST with frozen flows; accumulate level occupancy."""
         stacked = self._stack_flow_params(state.flow_params)
+        cov_chols = jnp.linalg.cholesky(state.local_cov)
         n_particles = int(state.x.shape[0])
-        sweep = self._make_sweep(stacked, state.log_lambda, n_particles)
+        sweep = self._make_sweep(stacked, state.log_lambda, cov_chols, n_particles)
 
         if progress:
             carry = (state.key, state.x, state.levels)
@@ -300,6 +333,7 @@ class Pipeline:
                 state.levels,
                 state.flow_params,
                 state.log_lambda,
+                state.local_cov,
             )
         return replace(state, x=x, levels=levels, key=key, counts=counts)
 
@@ -313,7 +347,7 @@ class Pipeline:
         Parameters
         ----------
         state:
-            Trained ensemble (flows / ``λ`` / positions frozen as the shared start).
+            Trained ensemble (flows / ``λ`` / ``local_cov`` / positions as start).
         keys:
             PRNG keys with shape ``(n_replicas,)`` (typed) or
             ``(n_replicas, 2)`` (legacy ``PRNGKey``).
@@ -335,13 +369,44 @@ class Pipeline:
         levels0 = state.levels
         flow_params = state.flow_params
         log_lambda = state.log_lambda
+        local_cov = state.local_cov
         run_st = self._run_st
 
         def one(key: Key):
-            _, x, levels, counts = run_st(key, x0, levels0, flow_params, log_lambda)
+            _, x, levels, counts = run_st(
+                key, x0, levels0, flow_params, log_lambda, local_cov
+            )
             return x, levels, counts
 
         return jax.vmap(one)(keys)
+
+    def update_local_cov(self, state: PipelineState) -> PipelineState:
+        """Refresh per-level ``Σ`` from the current particle cloud.
+
+        For each ladder level with at least ``LOCAL_COV_MIN_POINTS`` particles,
+        set ``Σ`` to the empirical covariance (+ ridge). Levels with too few
+        particles keep ``I``. Call this after burn-in / collect when dimensions
+        look correlated, then continue ``implement`` / ``implement_replicas``.
+        """
+        x = state.x
+        levels = state.levels
+        dim = x.shape[-1]
+        eye = jnp.eye(dim, dtype=x.dtype)
+        ridge = LOCAL_COV_RIDGE * eye
+        min_points = LOCAL_COV_MIN_POINTS
+        n_levels = self.n_levels
+
+        def cov_for_level(level: Array) -> Array:
+            mask = levels == level
+            n = jnp.sum(mask)
+            x_sum = jnp.sum(jnp.where(mask[:, None], x, 0.0), axis=0)
+            mean = x_sum / jnp.maximum(n, 1)
+            xc = jnp.where(mask[:, None], x - mean, 0.0)
+            cov = (xc.T @ xc) / jnp.maximum(n - 1, 1) + ridge
+            return jnp.where(n >= min_points, cov, eye)
+
+        local_cov = jax.vmap(cov_for_level)(jnp.arange(n_levels))
+        return replace(state, local_cov=local_cov)
 
     def tune_weight(self, state: PipelineState) -> PipelineState:
         """Update ``log λ`` from occupancy counts collected in ``implement``."""
