@@ -16,6 +16,7 @@ from typing import Any
 import jax.numpy as jnp
 import optax
 from jax import Array, grad, random
+from jax.random import Key
 from tqdm.auto import tqdm
 
 from krystal.tempering.constants import (
@@ -50,8 +51,8 @@ class PipelineState:
     log_lambda: Array
     """Log tempering weights, shape ``(n_levels,)``."""
 
-    key: Array
-    """PRNG key."""
+    key: Key
+    """JAX PRNG key (``jax.random.Key`` / ``jax.random.key``)."""
 
     opt_states: list[Any]
     """Optax state per edge."""
@@ -115,7 +116,7 @@ class Pipeline:
         """Number of consecutive bridges ``i → i+1``."""
         return self.n_levels - 1
 
-    def init_state(self, key: Array, x0: Array) -> PipelineState:
+    def init_state(self, key: Key, x0: Array) -> PipelineState:
         """Bootstrap state: particles at level 0 from easy samples ``x0``."""
         if x0.ndim != 2:
             raise ValueError("x0 must have shape (n_particles, dim)")
@@ -136,12 +137,12 @@ class Pipeline:
             counts=jnp.zeros(self.n_levels, dtype=jnp.int32),
         )
 
-    def _local_mh(
+    def _local_explore(
         self,
-        key: Array,
+        key: Key,
         x: Array,
         level: int,
-    ) -> tuple[Array, Array]:
+    ) -> tuple[Key, Array]:
         """Random-walk MH targeting ``π_level`` at fixed ladder index.
 
         Proposal: ``x' = x + σ ε``, ``ε ~ N(0, I)``, with
@@ -161,48 +162,34 @@ class Pipeline:
                 x = prop
         return key, x
 
-    def _mh_level_move(
+    def _jump_ladder(
         self,
-        key: Array,
+        key: Key,
         x: Array,
         level: int,
         proposed: int,
         flow_params: list[Any],
         log_lambda: Array,
-    ) -> tuple[Array, Array, int]:
-        """Single-particle MH move between neighboring levels."""
-        if proposed == level:
-            return key, x, level
-
+    ) -> tuple[Key, Array, int]:
+        """Single-particle MH jump between neighboring ladder levels."""
         if proposed == level + 1:
             edge = level
-            params = flow_params[edge]
-            y, log_det = self.flow.forward(params, x[None, :])
-            y = y[0]
-            log_det = log_det[0]
-            log_alpha = (
-                log_lambda[proposed]
-                + self.log_prob(proposed, y[None, :])[0]
-                - log_lambda[level]
-                - self.log_prob(level, x[None, :])[0]
-                + log_det
-            )
+            transform = self.flow.forward
         elif proposed == level - 1:
             edge = proposed
-            params = flow_params[edge]
-            y, log_det = self.flow.inverse(params, x[None, :])
-            y = y[0]
-            log_det = log_det[0]
-            log_alpha = (
-                log_lambda[proposed]
-                + self.log_prob(proposed, y[None, :])[0]
-                - log_lambda[level]
-                - self.log_prob(level, x[None, :])[0]
-                + log_det
-            )
+            transform = self.flow.inverse
         else:
             return key, x, level
 
+        y, log_det = transform(flow_params[edge], x[None, :])
+        y, log_det = y[0], log_det[0]
+        log_alpha = (
+            log_lambda[proposed]
+            + self.log_prob(proposed, y[None, :])[0]
+            - log_lambda[level]
+            - self.log_prob(level, x[None, :])[0]
+            + log_det
+        )
         key, u_key = random.split(key)
         if jnp.log(random.uniform(u_key)) < log_alpha:
             return key, y, proposed
@@ -221,21 +208,18 @@ class Pipeline:
         counts = jnp.zeros(self.n_levels, dtype=jnp.int32)
         n_particles = int(x.shape[0])
         max_level = self.n_levels - 1
-
-        sweeps = range(self.n_inner)
-        if progress:
-            sweeps = tqdm(sweeps, desc="implement (ST)", leave=False)
-
+        
+        sweeps = range(self.n_inner) if not progress else tqdm(range(self.n_inner), desc="implement (ST)", leave=False)
         for _ in sweeps:
             for p in range(n_particles):
                 level = int(levels[p])
-                key, new_x = self._local_mh(key, x[p], level)
+                key, new_x = self._local_explore(key, x[p], level)
                 x = x.at[p].set(new_x)
 
                 key, dir_key = random.split(key)
                 direction = 1 if bool(random.bernoulli(dir_key)) else -1
                 proposed = int(jnp.clip(level + direction, 0, max_level))
-                key, new_x, new_level = self._mh_level_move(
+                key, new_x, new_level = self._jump_ladder(
                     key,
                     x[p],
                     level,
@@ -270,10 +254,7 @@ class Pipeline:
         opt_states = list(state.opt_states)
         levels_np = state.levels
 
-        edges = range(self.n_edges)
-        if progress:
-            edges = tqdm(edges, desc="learn_flow", leave=False)
-
+        edges = range(self.n_edges) if not progress else tqdm(range(self.n_edges), desc="learn_flow", leave=False)
         for edge in edges:
             mask = levels_np == edge
             if not bool(jnp.any(mask)):
@@ -312,18 +293,33 @@ class Pipeline:
 
     def run(
         self,
-        state: PipelineState,
+        key: Key,
+        x0: Array,
         *,
         n_iterations: int = DEFAULT_OUTER_ITERATIONS,
         progress: bool = True,
+        history: list[dict[str, Array]] | None = None,
     ) -> PipelineState:
-        """Repeat ``step`` for ``n_iterations`` (default 10_000)."""
+        """Bootstrap from ``key`` / ``x0``, then repeat ``step`` for ``n_iterations``.
+
+        Equivalent to ``init_state`` then the outer train loop. Afterwards
+        ``state.flow_params`` / ``state.log_lambda`` are trained. Pass a list
+        as ``history`` to append per-iter ``occupancy`` and ``log_lambda``.
+        """
         if n_iterations < 0:
             raise ValueError("n_iterations must be >= 0")
-        steps = range(n_iterations)
-        if progress:
-            steps = tqdm(steps, desc="train (outer)")
+        state = self.init_state(key, x0)
+
+        steps = range(n_iterations) if not progress else tqdm(range(n_iterations), desc="train (outer)", leave=False)
         for _ in steps:
             # Nested bars off: outer bar is enough during ``run``.
             state = self.step(state, progress=False)
+            if history is not None:
+                total = jnp.maximum(state.counts.sum(), 1)
+                history.append(
+                    {
+                        "occupancy": state.counts / total,
+                        "log_lambda": state.log_lambda,
+                    }
+                )
         return state

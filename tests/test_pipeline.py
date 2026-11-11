@@ -107,8 +107,13 @@ def test_learn_flow_runs_when_particles_at_level_zero():
 def test_step_and_short_run_smoke():
     pipe = _tiny_pipeline(n_inner=4, learn_steps=1)
     key = random.PRNGKey(0)
-    state = pipe.init_state(random.PRNGKey(1), random.normal(key, (8, 2)))
+    x0 = random.normal(key, (8, 2))
+    state = pipe.init_state(random.PRNGKey(1), x0)
     state = pipe.step(state)
     assert state.counts.sum() > 0
-    state = pipe.run(state, n_iterations=2, progress=False)
+    history: list = []
+    state = pipe.run(random.PRNGKey(2), x0, n_iterations=2, progress=False, history=history)
     assert state.x.shape == (8, 2)
+    assert len(history) == 2
+    assert history[0]["occupancy"].shape == (pipe.n_levels,)
+    assert len(state.flow_params) == pipe.n_edges
