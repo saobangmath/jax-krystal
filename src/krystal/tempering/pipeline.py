@@ -5,6 +5,9 @@ Outer loop order:
 1. **Implement** — run ST with current flows; collect level occupancy.
 2. **Tune weight** — update ladder weights ``λ`` from occupancy.
 3. **Learn flow** — fit ``φ_{i→i+1}`` on the current particle snapshot.
+
+``implement`` is pure JAX (``vmap`` over particles, ``lax.scan`` over sweeps)
+so replica chains can be parallelized with ``implement_replicas``.
 """
 
 from __future__ import annotations
@@ -13,10 +16,12 @@ from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import Any
 
+import jax
 import jax.numpy as jnp
 import optax
-from jax import Array, grad, random
+from jax import Array, grad, lax, random
 from jax.random import Key
+from jax.tree_util import register_pytree_node_class, tree_map
 from tqdm.auto import tqdm
 
 from krystal.tempering.constants import (
@@ -32,9 +37,10 @@ from krystal.tempering.constants import (
 )
 from krystal.transport.base import Transformation
 
-LogProbFn = Callable[[int, Array], Array]
+LogProbFn = Callable[[Array | int, Array], Array]
 
 
+@register_pytree_node_class
 @dataclass
 class PipelineState:
     """Ensemble + flow / weight parameters for one Pipeline."""
@@ -60,6 +66,23 @@ class PipelineState:
     counts: Array
     """Visit counts from the last ``implement`` call, shape ``(n_levels,)``."""
 
+    def tree_flatten(self):
+        children = (
+            self.x,
+            self.levels,
+            self.flow_params,
+            self.log_lambda,
+            self.key,
+            self.opt_states,
+            self.counts,
+        )
+        return children, None
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        del aux_data
+        return cls(*children)
+
 
 @dataclass
 class Pipeline:
@@ -73,7 +96,8 @@ class Pipeline:
         Invertible map with ``init`` / ``forward`` / ``inverse`` (e.g. ``NICE``).
     log_prob:
         ``log_prob(level, x) -> Array`` unnormalized log-density for level
-        ``level``. ``x`` may be batched ``(n, dim)``; return shape ``(n,)``.
+        ``level`` (Python ``int`` or scalar array). ``x`` may be batched
+        ``(n, dim)``; return shape ``(n,)``.
     n_inner:
         ST sweeps inside each ``implement`` call.
     n_local:
@@ -137,63 +161,118 @@ class Pipeline:
             counts=jnp.zeros(self.n_levels, dtype=jnp.int32),
         )
 
+    def _stack_flow_params(self, flow_params: list[Any]) -> Any:
+        """Stack per-edge params into a single pytree with a leading edge axis."""
+        return tree_map(lambda *xs: jnp.stack(xs, axis=0), *flow_params)
+
     def _local_explore(
         self,
         key: Key,
         x: Array,
-        level: int,
+        level: Array,
     ) -> tuple[Key, Array]:
-        """Random-walk MH targeting ``π_level`` at fixed ladder index.
-
-        Proposal: ``x' = x + σ ε``, ``ε ~ N(0, I)``, with
-        ``σ = local_step_size * 2.38 / sqrt(d)`` so that the default
-        (``local_step_size=1``) has variance ``2.38² / d`` per coordinate.
-        """
+        """RW-MH at fixed ladder index (single particle; ``vmap``-friendly)."""
         dim = x.shape[-1]
         step = self.local_step_size * RW_MH_OPTIMAL_SCALE / jnp.sqrt(dim)
-        for _ in range(self.n_local):
+        log_prob = self.log_prob
+        n_local = self.n_local
+
+        def body(carry, _):
+            key, x = carry
             key, prop_key, u_key = random.split(key, 3)
             prop = x + step * random.normal(prop_key, x.shape)
-            log_alpha = (
-                self.log_prob(level, prop[None, :])[0]
-                - self.log_prob(level, x[None, :])[0]
-            )
-            if jnp.log(random.uniform(u_key)) < log_alpha:
-                x = prop
+            log_alpha = log_prob(level, prop[None, :])[0] - log_prob(level, x[None, :])[0]
+            accept = jnp.log(random.uniform(u_key)) < log_alpha
+            x = jnp.where(accept, prop, x)
+            return (key, x), None
+
+        (key, x), _ = lax.scan(body, (key, x), None, length=n_local)
         return key, x
 
     def _jump_ladder(
         self,
         key: Key,
         x: Array,
-        level: int,
-        proposed: int,
-        flow_params: list[Any],
+        level: Array,
+        stacked_params: Any,
         log_lambda: Array,
-    ) -> tuple[Key, Array, int]:
-        """Single-particle MH jump between neighboring ladder levels."""
-        if proposed == level + 1:
-            edge = level
-            transform = self.flow.forward
-        elif proposed == level - 1:
-            edge = proposed
-            transform = self.flow.inverse
-        else:
-            return key, x, level
+    ) -> tuple[Key, Array, Array]:
+        """Neighbor MH jump with flow proposal (single particle; ``vmap``-friendly)."""
+        max_level = self.n_levels - 1
+        flow = self.flow
+        log_prob = self.log_prob
 
-        y, log_det = transform(flow_params[edge], x[None, :])
-        y, log_det = y[0], log_det[0]
+        key, dir_key, u_key = random.split(key, 3)
+        direction = jnp.where(random.bernoulli(dir_key), 1, -1).astype(level.dtype)
+        proposed = jnp.clip(level + direction, 0, max_level)
+        going_up = proposed > level
+        going_down = proposed < level
+        moving = going_up | going_down
+        # Forward uses edge ``level``; inverse uses edge ``proposed``.
+        edge = jnp.where(going_up, level, proposed)
+
+        params_e = tree_map(lambda p: p[edge], stacked_params)
+        y_fwd, ld_fwd = flow.forward(params_e, x[None, :])
+        y_inv, ld_inv = flow.inverse(params_e, x[None, :])
+        y_fwd, ld_fwd = y_fwd[0], ld_fwd[0]
+        y_inv, ld_inv = y_inv[0], ld_inv[0]
+        # ``going_up`` is scalar under particle ``vmap``; broadcasts over ``dim``.
+        y = jnp.where(going_up, y_fwd, y_inv)
+        log_det = jnp.where(going_up, ld_fwd, ld_inv)
+
         log_alpha = (
             log_lambda[proposed]
-            + self.log_prob(proposed, y[None, :])[0]
+            + log_prob(proposed, y[None, :])[0]
             - log_lambda[level]
-            - self.log_prob(level, x[None, :])[0]
+            - log_prob(level, x[None, :])[0]
             + log_det
         )
-        key, u_key = random.split(key)
-        if jnp.log(random.uniform(u_key)) < log_alpha:
-            return key, y, proposed
-        return key, x, level
+        accept = moving & (jnp.log(random.uniform(u_key)) < log_alpha)
+        new_x = jnp.where(accept, y, x)
+        new_level = jnp.where(accept, proposed, level)
+        return key, new_x, new_level
+
+    def _make_sweep(self, stacked_params: Any, log_lambda: Array, n_particles: int):
+        """Build one ST sweep: ``vmap`` local explore + jump over particles."""
+        n_levels = self.n_levels
+        local_explore = self._local_explore
+        jump_ladder = self._jump_ladder
+
+        def one_particle(p_key: Key, x: Array, level: Array):
+            p_key, x = local_explore(p_key, x, level)
+            p_key, x, level = jump_ladder(p_key, x, level, stacked_params, log_lambda)
+            return p_key, x, level
+
+        def sweep(carry, _):
+            key, x, levels = carry
+            keys = random.split(key, n_particles + 1)
+            key = keys[0]
+            _, x, levels = jax.vmap(one_particle)(keys[1:], x, levels)
+            delta = jnp.bincount(levels, length=n_levels)
+            return (key, x, levels), delta
+
+        return sweep
+
+    def _run_st(
+        self,
+        key: Key,
+        x: Array,
+        levels: Array,
+        flow_params: list[Any],
+        log_lambda: Array,
+        *,
+        n_inner: int | None = None,
+    ) -> tuple[Key, Array, Array, Array]:
+        """Pure ST: ``scan`` over sweeps. Returns ``(key, x, levels, counts)``."""
+        n_inner = self.n_inner if n_inner is None else n_inner
+        stacked = self._stack_flow_params(flow_params)
+        n_particles = int(x.shape[0])
+        sweep = self._make_sweep(stacked, log_lambda, n_particles)
+        (key, x, levels), deltas = lax.scan(
+            sweep, (key, x, levels), None, length=n_inner
+        )
+        counts = jnp.sum(deltas, axis=0)
+        return key, x, levels, counts
 
     def implement(
         self,
@@ -202,36 +281,67 @@ class Pipeline:
         progress: bool = False,
     ) -> PipelineState:
         """Run ST with frozen flows; accumulate level occupancy."""
-        x = state.x
-        levels = state.levels
-        key = state.key
-        counts = jnp.zeros(self.n_levels, dtype=jnp.int32)
-        n_particles = int(x.shape[0])
-        max_level = self.n_levels - 1
-        
-        sweeps = range(self.n_inner) if not progress else tqdm(range(self.n_inner), desc="implement (ST)", leave=False)
-        for _ in sweeps:
-            for p in range(n_particles):
-                level = int(levels[p])
-                key, new_x = self._local_explore(key, x[p], level)
-                x = x.at[p].set(new_x)
+        stacked = self._stack_flow_params(state.flow_params)
+        n_particles = int(state.x.shape[0])
+        sweep = self._make_sweep(stacked, state.log_lambda, n_particles)
 
-                key, dir_key = random.split(key)
-                direction = 1 if bool(random.bernoulli(dir_key)) else -1
-                proposed = int(jnp.clip(level + direction, 0, max_level))
-                key, new_x, new_level = self._jump_ladder(
-                    key,
-                    x[p],
-                    level,
-                    proposed,
-                    state.flow_params,
-                    state.log_lambda,
-                )
-                x = x.at[p].set(new_x)
-                levels = levels.at[p].set(new_level)
-            counts = counts + jnp.bincount(levels, length=self.n_levels)
-
+        if progress:
+            carry = (state.key, state.x, state.levels)
+            counts = jnp.zeros(self.n_levels, dtype=jnp.int32)
+            sweep_j = jax.jit(sweep)
+            for _ in tqdm(range(self.n_inner), desc="implement (ST)", leave=False):
+                carry, delta = sweep_j(carry, None)
+                counts = counts + delta
+            key, x, levels = carry
+        else:
+            key, x, levels, counts = self._run_st(
+                state.key,
+                state.x,
+                state.levels,
+                state.flow_params,
+                state.log_lambda,
+            )
         return replace(state, x=x, levels=levels, key=key, counts=counts)
+
+    def implement_replicas(
+        self,
+        state: PipelineState,
+        keys: Array,
+    ) -> tuple[Array, Array, Array]:
+        """Run independent ST chains in parallel from a shared snapshot.
+
+        Parameters
+        ----------
+        state:
+            Trained ensemble (flows / ``λ`` / positions frozen as the shared start).
+        keys:
+            PRNG keys with shape ``(n_replicas,)`` (typed) or
+            ``(n_replicas, 2)`` (legacy ``PRNGKey``).
+
+        Returns
+        -------
+        xs:
+            ``(n_replicas, n_particles, dim)``
+        levels:
+            ``(n_replicas, n_particles)``
+        counts:
+            ``(n_replicas, n_levels)``
+        """
+        # Typed keys: ``(n_replicas,)``; legacy ``PRNGKey``: ``(n_replicas, 2)``.
+        if keys.ndim == 0 or keys.ndim > 2 or (keys.ndim == 2 and keys.shape[-1] != 2):
+            raise ValueError("keys must have shape (n_replicas,) or (n_replicas, 2)")
+
+        x0 = state.x
+        levels0 = state.levels
+        flow_params = state.flow_params
+        log_lambda = state.log_lambda
+        run_st = self._run_st
+
+        def one(key: Key):
+            _, x, levels, counts = run_st(key, x0, levels0, flow_params, log_lambda)
+            return x, levels, counts
+
+        return jax.vmap(one)(keys)
 
     def tune_weight(self, state: PipelineState) -> PipelineState:
         """Update ``log λ`` from occupancy counts collected in ``implement``."""
@@ -254,7 +364,11 @@ class Pipeline:
         opt_states = list(state.opt_states)
         levels_np = state.levels
 
-        edges = range(self.n_edges) if not progress else tqdm(range(self.n_edges), desc="learn_flow", leave=False)
+        edges = (
+            range(self.n_edges)
+            if not progress
+            else tqdm(range(self.n_edges), desc="learn_flow", leave=False)
+        )
         for edge in edges:
             mask = levels_np == edge
             if not bool(jnp.any(mask)):
@@ -310,7 +424,11 @@ class Pipeline:
             raise ValueError("n_iterations must be >= 0")
         state = self.init_state(key, x0)
 
-        steps = range(n_iterations) if not progress else tqdm(range(n_iterations), desc="train (outer)", leave=False)
+        steps = (
+            range(n_iterations)
+            if not progress
+            else tqdm(range(n_iterations), desc="train (outer)", leave=False)
+        )
         for _ in steps:
             # Nested bars off: outer bar is enough during ``run``.
             state = self.step(state, progress=False)
