@@ -6,6 +6,11 @@ Outer loop order:
 2. **Tune weight** — update ladder weights ``λ`` from occupancy.
 3. **Learn flow** — fit ``φ_{i→i+1}`` on the current particle snapshot.
 
+Ladder jumps use a **lifted / non-reversible** kernel: each particle carries a
+persistent direction ``V ∈ {+1, -1}``, always proposes ``I → I + V`` (with flow),
+keeps ``V`` on accept, and flips ``V`` on MH reject or at a ladder boundary
+(ST analogue of DEO persistence from non-reversible PT).
+
 ``implement`` is pure JAX (``vmap`` over particles, ``lax.scan`` over sweeps)
 so replica chains can be parallelized with ``implement_replicas``.
 """
@@ -53,6 +58,9 @@ class PipelineState:
     levels: Array
     """Integer ladder index per particle, shape ``(n_particles,)``."""
 
+    directions: Array
+    """Persistent direction ``V ∈ {+1, -1}`` per particle, shape ``(n_particles,)``."""
+
     flow_params: list[Any]
     """Parameters for each edge ``i → i+1`` (length ``n_levels - 1``)."""
 
@@ -79,6 +87,7 @@ class PipelineState:
         children = (
             self.x,
             self.levels,
+            self.directions,
             self.flow_params,
             self.log_lambda,
             self.key,
@@ -169,6 +178,8 @@ class Pipeline:
         return PipelineState(
             x=x0,
             levels=jnp.zeros(n_particles, dtype=jnp.int32),
+            # Start climbing from the hot end (level 0).
+            directions=jnp.ones(n_particles, dtype=jnp.int32),
             flow_params=flow_params,
             log_lambda=jnp.zeros(self.n_levels),
             key=keys[-1],
@@ -218,22 +229,27 @@ class Pipeline:
         key: Key,
         x: Array,
         level: Array,
+        direction: Array,
         stacked_params: Any,
         log_lambda: Array,
-    ) -> tuple[Key, Array, Array]:
-        """Neighbor MH jump with flow proposal (single particle; ``vmap``-friendly)."""
+    ) -> tuple[Key, Array, Array, Array]:
+        """Lifted neighbor MH: propose ``I → I + V``; flip ``V`` on reject / boundary.
+
+        Single particle; ``vmap``-friendly. On accept keep ``V``; on MH reject or
+        when ``I + V`` leaves ``{0, ..., T}``, set ``V ← -V`` and stay put.
+        """
         max_level = self.n_levels - 1
         flow = self.flow
         log_prob = self.log_prob
 
-        key, dir_key, u_key = random.split(key, 3)
-        direction = jnp.where(random.bernoulli(dir_key), 1, -1).astype(level.dtype)
-        proposed = jnp.clip(level + direction, 0, max_level)
-        going_up = proposed > level
-        going_down = proposed < level
-        moving = going_up | going_down
+        key, u_key = random.split(key, 2)
+        proposed = level + direction
+        at_boundary = (proposed < 0) | (proposed > max_level)
+        # Clip only for safe indexing when evaluating the (unused) boundary case.
+        proposed_safe = jnp.clip(proposed, 0, max_level)
+        going_up = direction > 0
         # Forward uses edge ``level``; inverse uses edge ``proposed``.
-        edge = jnp.where(going_up, level, proposed)
+        edge = jnp.where(going_up, level, proposed_safe)
 
         params_e = tree_map(lambda p: p[edge], stacked_params)
         y_fwd, ld_fwd = flow.forward(params_e, x[None, :])
@@ -245,16 +261,18 @@ class Pipeline:
         log_det = jnp.where(going_up, ld_fwd, ld_inv)
 
         log_alpha = (
-            log_lambda[proposed]
-            + log_prob(proposed, y[None, :])[0]
+            log_lambda[proposed_safe]
+            + log_prob(proposed_safe, y[None, :])[0]
             - log_lambda[level]
             - log_prob(level, x[None, :])[0]
             + log_det
         )
-        accept = moving & (jnp.log(random.uniform(u_key)) < log_alpha)
+        accept = (~at_boundary) & (jnp.log(random.uniform(u_key)) < log_alpha)
+        # Reject or boundary → flip direction; accept → keep direction.
+        new_direction = jnp.where(accept, direction, -direction).astype(direction.dtype)
         new_x = jnp.where(accept, y, x)
-        new_level = jnp.where(accept, proposed, level)
-        return key, new_x, new_level
+        new_level = jnp.where(accept, proposed_safe, level)
+        return key, new_x, new_level, new_direction
 
     def _make_sweep(
         self,
@@ -263,23 +281,27 @@ class Pipeline:
         cov_chols: Array,
         n_particles: int,
     ):
-        """Build one ST sweep: ``vmap`` local explore + jump over particles."""
+        """Build one ST sweep: ``vmap`` local explore + lifted jump over particles."""
         n_levels = self.n_levels
         local_explore = self._local_explore
         jump_ladder = self._jump_ladder
 
-        def one_particle(p_key: Key, x: Array, level: Array):
+        def one_particle(p_key: Key, x: Array, level: Array, direction: Array):
             p_key, x = local_explore(p_key, x, level, cov_chols)
-            p_key, x, level = jump_ladder(p_key, x, level, stacked_params, log_lambda)
-            return p_key, x, level
+            p_key, x, level, direction = jump_ladder(
+                p_key, x, level, direction, stacked_params, log_lambda
+            )
+            return p_key, x, level, direction
 
         def sweep(carry, _):
-            key, x, levels = carry
+            key, x, levels, directions = carry
             keys = random.split(key, n_particles + 1)
             key = keys[0]
-            _, x, levels = jax.vmap(one_particle)(keys[1:], x, levels)
+            _, x, levels, directions = jax.vmap(one_particle)(
+                keys[1:], x, levels, directions
+            )
             delta = jnp.bincount(levels, length=n_levels)
-            return (key, x, levels), delta
+            return (key, x, levels, directions), delta
 
         return sweep
 
@@ -288,23 +310,27 @@ class Pipeline:
         key: Key,
         x: Array,
         levels: Array,
+        directions: Array,
         flow_params: list[Any],
         log_lambda: Array,
         local_cov: Array,
         *,
         n_inner: int | None = None,
-    ) -> tuple[Key, Array, Array, Array]:
-        """Pure ST: ``scan`` over sweeps. Returns ``(key, x, levels, counts)``."""
+    ) -> tuple[Key, Array, Array, Array, Array]:
+        """Pure lifted ST: ``scan`` over sweeps.
+
+        Returns ``(key, x, levels, directions, counts)``.
+        """
         n_inner = self.n_inner if n_inner is None else n_inner
         stacked = self._stack_flow_params(flow_params)
         cov_chols = jnp.linalg.cholesky(local_cov)
         n_particles = int(x.shape[0])
         sweep = self._make_sweep(stacked, log_lambda, cov_chols, n_particles)
-        (key, x, levels), deltas = lax.scan(
-            sweep, (key, x, levels), None, length=n_inner
+        (key, x, levels, directions), deltas = lax.scan(
+            sweep, (key, x, levels, directions), None, length=n_inner
         )
         counts = jnp.sum(deltas, axis=0)
-        return key, x, levels, counts
+        return key, x, levels, directions, counts
 
     def implement(
         self,
@@ -312,42 +338,45 @@ class Pipeline:
         *,
         progress: bool = False,
     ) -> PipelineState:
-        """Run ST with frozen flows; accumulate level occupancy."""
+        """Run lifted ST with frozen flows; accumulate level occupancy."""
         stacked = self._stack_flow_params(state.flow_params)
         cov_chols = jnp.linalg.cholesky(state.local_cov)
         n_particles = int(state.x.shape[0])
         sweep = self._make_sweep(stacked, state.log_lambda, cov_chols, n_particles)
 
         if progress:
-            carry = (state.key, state.x, state.levels)
+            carry = (state.key, state.x, state.levels, state.directions)
             counts = jnp.zeros(self.n_levels, dtype=jnp.int32)
             sweep_j = jax.jit(sweep)
             for _ in tqdm(range(self.n_inner), desc="implement (ST)", leave=False):
                 carry, delta = sweep_j(carry, None)
                 counts = counts + delta
-            key, x, levels = carry
+            key, x, levels, directions = carry
         else:
-            key, x, levels, counts = self._run_st(
+            key, x, levels, directions, counts = self._run_st(
                 state.key,
                 state.x,
                 state.levels,
+                state.directions,
                 state.flow_params,
                 state.log_lambda,
                 state.local_cov,
             )
-        return replace(state, x=x, levels=levels, key=key, counts=counts)
+        return replace(
+            state, x=x, levels=levels, directions=directions, key=key, counts=counts
+        )
 
     def implement_replicas(
         self,
         state: PipelineState,
         keys: Array,
-    ) -> tuple[Array, Array, Array]:
-        """Run independent ST chains in parallel from a shared snapshot.
+    ) -> tuple[Array, Array, Array, Array]:
+        """Run independent lifted ST chains in parallel from a shared snapshot.
 
         Parameters
         ----------
         state:
-            Trained ensemble (flows / ``λ`` / ``local_cov`` / positions as start).
+            Trained ensemble (flows / ``λ`` / ``local_cov`` / positions / ``V``).
         keys:
             PRNG keys with shape ``(n_replicas,)`` (typed) or
             ``(n_replicas, 2)`` (legacy ``PRNGKey``).
@@ -358,6 +387,8 @@ class Pipeline:
             ``(n_replicas, n_particles, dim)``
         levels:
             ``(n_replicas, n_particles)``
+        directions:
+            ``(n_replicas, n_particles)``
         counts:
             ``(n_replicas, n_levels)``
         """
@@ -367,16 +398,17 @@ class Pipeline:
 
         x0 = state.x
         levels0 = state.levels
+        directions0 = state.directions
         flow_params = state.flow_params
         log_lambda = state.log_lambda
         local_cov = state.local_cov
         run_st = self._run_st
 
         def one(key: Key):
-            _, x, levels, counts = run_st(
-                key, x0, levels0, flow_params, log_lambda, local_cov
+            _, x, levels, directions, counts = run_st(
+                key, x0, levels0, directions0, flow_params, log_lambda, local_cov
             )
-            return x, levels, counts
+            return x, levels, directions, counts
 
         return jax.vmap(one)(keys)
 

@@ -17,7 +17,8 @@ class Node:
         (levels ``0, ..., T``). The actual β / temperature values live on
         the ladder container, not on each node.
     internal_state:
-        Node-local state (e.g. configuration ``x``, or a broader pytree).
+        Node-local state (e.g. configuration ``x``, lifted direction ``V``,
+        or a broader pytree).
     """
 
     temperature_ladder: int
