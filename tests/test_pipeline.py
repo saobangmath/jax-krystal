@@ -1,5 +1,7 @@
 """Pipeline: ladder wiring and CRAFT-ST stage smoke tests."""
 
+from dataclasses import replace
+
 import jax
 import jax.numpy as jnp
 import pytest
@@ -65,6 +67,8 @@ def test_init_state_at_level_zero():
     assert state.x.shape == (16, 2)
     assert state.levels.shape == (16,)
     assert jnp.all(state.levels == 0)
+    assert state.directions.shape == (16,)
+    assert jnp.all(state.directions == 1)
     assert len(state.flow_params) == pipe.n_edges
     assert state.log_lambda.shape == (pipe.n_levels,)
     assert state.local_cov.shape == (pipe.n_levels, 2, 2)
@@ -81,6 +85,8 @@ def test_implement_updates_counts_and_preserves_shape():
     assert state.counts.shape == (pipe.n_levels,)
     assert int(state.counts.sum()) == 12 * pipe.n_inner
     assert jnp.all((state.levels >= 0) & (state.levels < pipe.n_levels))
+    assert state.directions.shape == (12,)
+    assert jnp.all((state.directions == 1) | (state.directions == -1))
 
 
 def test_tune_weight_changes_log_lambda():
@@ -128,14 +134,41 @@ def test_implement_replicas_parallel_collect():
     state = pipe.init_state(random.PRNGKey(1), x0)
     n_replicas = 3
     keys = random.split(random.PRNGKey(2), n_replicas)
-    xs, levels, counts = pipe.implement_replicas(state, keys)
+    xs, levels, directions, counts = pipe.implement_replicas(state, keys)
     assert xs.shape == (n_replicas, 10, 2)
     assert levels.shape == (n_replicas, 10)
+    assert directions.shape == (n_replicas, 10)
     assert counts.shape == (n_replicas, pipe.n_levels)
     assert int(counts.sum()) == n_replicas * 10 * pipe.n_inner
     assert jnp.all((levels >= 0) & (levels < pipe.n_levels))
+    assert jnp.all((directions == 1) | (directions == -1))
     # Shared start + different keys → not all replicas identical.
     assert not jnp.allclose(xs[0], xs[1])
+
+
+def test_lifted_jump_flips_at_hot_boundary():
+    """At level 0 with V=-1, boundary reflection flips V without moving."""
+    pipe = _tiny_pipeline(n_inner=1, n_levels=3)
+    key = random.PRNGKey(0)
+    x0 = random.normal(key, (4, 2))
+    state = pipe.init_state(random.PRNGKey(1), x0)
+    state = replace(state, directions=-jnp.ones(4, dtype=jnp.int32))
+    # One jump attempt from the boundary downward → all should flip to +1, stay at 0.
+    stacked = pipe._stack_flow_params(state.flow_params)
+    keys = random.split(random.PRNGKey(2), 4)
+
+    def one(k, x, level, direction):
+        _, x2, level2, direction2 = pipe._jump_ladder(
+            k, x, level, direction, stacked, state.log_lambda
+        )
+        return x2, level2, direction2
+
+    xs, levels, directions = jax.vmap(one)(
+        keys, state.x, state.levels, state.directions
+    )
+    assert jnp.all(levels == 0)
+    assert jnp.all(directions == 1)
+    assert jnp.allclose(xs, state.x)
 
 
 def test_update_local_cov_estimates_correlation():

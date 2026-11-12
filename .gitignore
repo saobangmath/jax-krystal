@@ -39,3 +39,4 @@ lightning_logs/
 *.pem
 
 *.ipynb_checkpoints/
+TODO.md
