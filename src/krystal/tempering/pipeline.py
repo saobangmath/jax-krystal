@@ -26,7 +26,7 @@ import jax.numpy as jnp
 import optax
 from jax import Array, grad, lax, random
 from jax.random import Key
-from jax.tree_util import register_pytree_node_class, tree_map
+from jax.tree_util import register_pytree_node_class
 from tqdm.auto import tqdm
 
 from krystal.tempering.constants import (
@@ -190,7 +190,7 @@ class Pipeline:
 
     def _stack_flow_params(self, flow_params: list[Any]) -> Any:
         """Stack per-edge params into a single pytree with a leading edge axis."""
-        return tree_map(lambda *xs: jnp.stack(xs, axis=0), *flow_params)
+        return jax.tree.map(lambda *xs: jnp.stack(xs, axis=0), *flow_params)
 
     def _local_explore(
         self,
@@ -251,7 +251,7 @@ class Pipeline:
         # Forward uses edge ``level``; inverse uses edge ``proposed``.
         edge = jnp.where(going_up, level, proposed_safe)
 
-        params_e = tree_map(lambda p: p[edge], stacked_params)
+        params_e = jax.tree.map(lambda p: p[edge], stacked_params)
         y_fwd, ld_fwd = flow.forward(params_e, x[None, :])
         y_inv, ld_inv = flow.inverse(params_e, x[None, :])
         y_fwd, ld_fwd = y_fwd[0], ld_fwd[0]
