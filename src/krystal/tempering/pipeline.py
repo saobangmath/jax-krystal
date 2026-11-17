@@ -1,10 +1,19 @@
 """CRAFT-style tempering pipeline for Simulated Tempering.
 
-Outer loop order:
+One outer iteration (``Pipeline.step``) has three stages:
 
-1. **Implement** — run ST with current flows; collect level occupancy.
-2. **Tune weight** — update ladder weights ``λ`` from occupancy.
-3. **Learn flow** — fit ``φ_{i→i+1}`` on the current particle snapshot.
+1. **Implement** — run ST with frozen flows; count how often each level is visited.
+2. **Tune weight** — update ladder weights ``λ`` from those visit counts.
+3. **Learn flow** — fit ``φ_{i→i+1}`` on the particles currently at level ``i``.
+
+Where things live:
+
+- ``context.py`` — ``STContext``, the read-only inputs shared by every sweep.
+- ``kernels.py`` — the per-particle moves (random-walk MH, lifted ladder jump)
+  and ``st_sweep``, which ``vmap``s them over all particles.
+- ``state.py`` — ``PipelineState``, the data carried between stages.
+- this file — the orchestration: ``implement`` scans ``st_sweep`` over
+  ``n_inner`` sweeps; ``tune_weight`` / ``learn_flow`` are the two updates.
 
 Ladder jumps use a **lifted / non-reversible** kernel: each particle carries a
 persistent direction ``V ∈ {+1, -1}``, always proposes ``I → I + V`` (with flow),
@@ -17,7 +26,6 @@ so replica chains can be parallelized with ``implement_replicas``.
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -39,12 +47,11 @@ from krystal.tempering.constants import (
     LOCAL_COV_MIN_POINTS,
     LOCAL_COV_RIDGE,
     OCCUPANCY_PSEUDOCOUNT,
-    RW_MH_OPTIMAL_SCALE,
 )
+from krystal.tempering.context import LogProbFn, STContext
+from krystal.tempering.kernels import st_sweep
 from krystal.tempering.state import PipelineState
 from krystal.transport.base import Transformation
-
-LogProbFn = Callable[[Array | int, Array], Array]
 
 
 @dataclass
@@ -133,121 +140,26 @@ class Pipeline:
         )
 
     def _stack_flow_params(self, flow_params: list[Any]) -> Any:
-        """Stack per-edge params into a single pytree with a leading edge axis."""
+        """Stack per-edge params into one pytree with a leading edge axis.
+
+        Lets a traced edge index pick params inside ``vmap``: ``p[edge]``.
+        """
         return jax.tree.map(lambda *xs: jnp.stack(xs, axis=0), *flow_params)
 
-    def _local_explore(
-        self,
-        key: Key,
-        x: Array,
-        level: Array,
-        cov_chols: Array,
-    ) -> tuple[Key, Array]:
-        """RW-MH at fixed ladder index (single particle; ``vmap``-friendly).
-
-        Proposal: ``x' = x + (s · 2.38 / √d) · L_level ε`` with ``ε ~ N(0, I)``
-        and ``Σ_level = L_level L_levelᵀ``, i.e. ``N(x, (2.38² / d) Σ_level)``
-        when ``s = local_step_size``.
-        """
-        dim = x.shape[-1]
-        scale = self.local_step_size * RW_MH_OPTIMAL_SCALE / jnp.sqrt(dim)
-        L = cov_chols[level]
-        log_prob = self.log_prob
-        n_local = self.n_local
-
-        def body(carry, _):
-            key, x = carry
-            key, prop_key, u_key = random.split(key, 3)
-            eps = random.normal(prop_key, x.shape)
-            prop = x + scale * (L @ eps)
-            log_alpha = log_prob(level, prop[None, :])[0] - log_prob(level, x[None, :])[0]
-            accept = jnp.log(random.uniform(u_key)) < log_alpha
-            x = jnp.where(accept, prop, x)
-            return (key, x), None
-
-        (key, x), _ = lax.scan(body, (key, x), None, length=n_local)
-        return key, x
-
-    def _jump_ladder(
-        self,
-        key: Key,
-        x: Array,
-        level: Array,
-        direction: Array,
-        stacked_params: Any,
-        log_lambda: Array,
-    ) -> tuple[Key, Array, Array, Array]:
-        """Lifted neighbor MH: propose ``I → I + V``; flip ``V`` on reject / boundary.
-
-        Single particle; ``vmap``-friendly. On accept keep ``V``; on MH reject or
-        when ``I + V`` leaves ``{0, ..., T}``, set ``V ← -V`` and stay put.
-        """
-        max_level = self.n_levels - 1
-        flow = self.flow
-        log_prob = self.log_prob
-
-        key, u_key = random.split(key, 2)
-        proposed = level + direction
-        at_boundary = (proposed < 0) | (proposed > max_level)
-        # Clip only for safe indexing when evaluating the (unused) boundary case.
-        proposed_safe = jnp.clip(proposed, 0, max_level)
-        going_up = direction > 0
-        # Forward uses edge ``level``; inverse uses edge ``proposed``.
-        edge = jnp.where(going_up, level, proposed_safe)
-
-        params_e = jax.tree.map(lambda p: p[edge], stacked_params)
-        y_fwd, ld_fwd = flow.forward(params_e, x[None, :])
-        y_inv, ld_inv = flow.inverse(params_e, x[None, :])
-        y_fwd, ld_fwd = y_fwd[0], ld_fwd[0]
-        y_inv, ld_inv = y_inv[0], ld_inv[0]
-        # ``going_up`` is scalar under particle ``vmap``; broadcasts over ``dim``.
-        y = jnp.where(going_up, y_fwd, y_inv)
-        log_det = jnp.where(going_up, ld_fwd, ld_inv)
-
-        log_alpha = (
-            log_lambda[proposed_safe]
-            + log_prob(proposed_safe, y[None, :])[0]
-            - log_lambda[level]
-            - log_prob(level, x[None, :])[0]
-            + log_det
+    def _context(
+        self, flow_params: list[Any], log_lambda: Array, local_cov: Array
+    ) -> STContext:
+        """Freeze the current flows / ``λ`` / ``Σ`` plus settings for the kernels."""
+        return STContext(
+            flow=self.flow,
+            log_prob=self.log_prob,
+            n_levels=self.n_levels,
+            step_size=self.local_step_size,
+            n_local=self.n_local,
+            stacked_params=self._stack_flow_params(flow_params),
+            log_lambda=log_lambda,
+            cov_chols=jnp.linalg.cholesky(local_cov),
         )
-        accept = (~at_boundary) & (jnp.log(random.uniform(u_key)) < log_alpha)
-        # Reject or boundary → flip direction; accept → keep direction.
-        new_direction = jnp.where(accept, direction, -direction).astype(direction.dtype)
-        new_x = jnp.where(accept, y, x)
-        new_level = jnp.where(accept, proposed_safe, level)
-        return key, new_x, new_level, new_direction
-
-    def _make_sweep(
-        self,
-        stacked_params: Any,
-        log_lambda: Array,
-        cov_chols: Array,
-        n_particles: int,
-    ):
-        """Build one ST sweep: ``vmap`` local explore + lifted jump over particles."""
-        n_levels = self.n_levels
-        local_explore = self._local_explore
-        jump_ladder = self._jump_ladder
-
-        def one_particle(p_key: Key, x: Array, level: Array, direction: Array):
-            p_key, x = local_explore(p_key, x, level, cov_chols)
-            p_key, x, level, direction = jump_ladder(
-                p_key, x, level, direction, stacked_params, log_lambda
-            )
-            return p_key, x, level, direction
-
-        def sweep(carry, _):
-            key, x, levels, directions = carry
-            keys = random.split(key, n_particles + 1)
-            key = keys[0]
-            _, x, levels, directions = jax.vmap(one_particle)(
-                keys[1:], x, levels, directions
-            )
-            delta = jnp.bincount(levels, length=n_levels)
-            return (key, x, levels, directions), delta
-
-        return sweep
 
     def _run_st(
         self,
@@ -258,54 +170,37 @@ class Pipeline:
         flow_params: list[Any],
         log_lambda: Array,
         local_cov: Array,
-        *,
-        n_inner: int | None = None,
     ) -> tuple[Key, Array, Array, Array, Array]:
-        """Pure lifted ST: ``scan`` over sweeps.
+        """Scan ``st_sweep`` for ``n_inner`` sweeps (pure function of its inputs).
 
-        Returns ``(key, x, levels, directions, counts)``.
+        Returns ``(key, x, levels, directions, counts)`` where ``counts`` sums
+        the per-sweep level visits, shape ``(n_levels,)``.
         """
-        n_inner = self.n_inner if n_inner is None else n_inner
-        stacked = self._stack_flow_params(flow_params)
-        cov_chols = jnp.linalg.cholesky(local_cov)
-        n_particles = int(x.shape[0])
-        sweep = self._make_sweep(stacked, log_lambda, cov_chols, n_particles)
-        (key, x, levels, directions), deltas = lax.scan(
-            sweep, (key, x, levels, directions), None, length=n_inner
-        )
-        counts = jnp.sum(deltas, axis=0)
-        return key, x, levels, directions, counts
+        ctx = self._context(flow_params, log_lambda, local_cov)
 
-    def implement(
-        self,
-        state: PipelineState,
-        *,
-        progress: bool = False,
-    ) -> PipelineState:
-        """Run lifted ST with frozen flows; accumulate level occupancy."""
-        stacked = self._stack_flow_params(state.flow_params)
-        cov_chols = jnp.linalg.cholesky(state.local_cov)
-        n_particles = int(state.x.shape[0])
-        sweep = self._make_sweep(stacked, state.log_lambda, cov_chols, n_particles)
-
-        if progress:
-            carry = (state.key, state.x, state.levels, state.directions)
-            counts = jnp.zeros(self.n_levels, dtype=jnp.int32)
-            sweep_j = jax.jit(sweep)
-            for _ in tqdm(range(self.n_inner), desc="implement (ST)", leave=False):
-                carry, delta = sweep_j(carry, None)
-                counts = counts + delta
+        def one_sweep(carry, _):
             key, x, levels, directions = carry
-        else:
-            key, x, levels, directions, counts = self._run_st(
-                state.key,
-                state.x,
-                state.levels,
-                state.directions,
-                state.flow_params,
-                state.log_lambda,
-                state.local_cov,
+            key, x, levels, directions, visits = st_sweep(
+                key, x, levels, directions, ctx
             )
+            return (key, x, levels, directions), visits
+
+        (key, x, levels, directions), visits = lax.scan(
+            one_sweep, (key, x, levels, directions), None, length=self.n_inner
+        )
+        return key, x, levels, directions, visits.sum(axis=0)
+
+    def implement(self, state: PipelineState) -> PipelineState:
+        """Run lifted ST with frozen flows; accumulate level occupancy."""
+        key, x, levels, directions, counts = self._run_st(
+            state.key,
+            state.x,
+            state.levels,
+            state.directions,
+            state.flow_params,
+            state.log_lambda,
+            state.local_cov,
+        )
         return replace(
             state, x=x, levels=levels, directions=directions, key=key, counts=counts
         )
@@ -340,21 +235,19 @@ class Pipeline:
         if keys.ndim == 0 or keys.ndim > 2 or (keys.ndim == 2 and keys.shape[-1] != 2):
             raise ValueError("keys must have shape (n_replicas,) or (n_replicas, 2)")
 
-        x0 = state.x
-        levels0 = state.levels
-        directions0 = state.directions
-        flow_params = state.flow_params
-        log_lambda = state.log_lambda
-        local_cov = state.local_cov
-        run_st = self._run_st
-
-        def one(key: Key):
-            _, x, levels, directions, counts = run_st(
-                key, x0, levels0, directions0, flow_params, log_lambda, local_cov
+        def one_replica(key: Key):
+            _, x, levels, directions, counts = self._run_st(
+                key,
+                state.x,
+                state.levels,
+                state.directions,
+                state.flow_params,
+                state.log_lambda,
+                state.local_cov,
             )
             return x, levels, directions, counts
 
-        return jax.vmap(one)(keys)
+        return jax.vmap(one_replica)(keys)
 
     def update_local_cov(self, state: PipelineState) -> PipelineState:
         """Refresh per-level ``Σ`` from the current particle cloud.
@@ -441,7 +334,7 @@ class Pipeline:
         progress: bool = False,
     ) -> PipelineState:
         """One outer iteration: implement → tune weight → learn flow."""
-        state = self.implement(state, progress=progress)
+        state = self.implement(state)
         state = self.tune_weight(state)
         state = self.learn_flow(state, progress=progress)
         return state

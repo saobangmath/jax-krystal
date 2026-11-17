@@ -8,6 +8,7 @@ import pytest
 from jax import random
 
 from krystal.tempering import Pipeline, PipelineState
+from krystal.tempering.kernels import ladder_jump
 from krystal.transport import NICE
 
 
@@ -154,14 +155,11 @@ def test_lifted_jump_flips_at_hot_boundary():
     state = pipe.init_state(random.PRNGKey(1), x0)
     state = replace(state, directions=-jnp.ones(4, dtype=jnp.int32))
     # One jump attempt from the boundary downward → all should flip to +1, stay at 0.
-    stacked = pipe._stack_flow_params(state.flow_params)
+    ctx = pipe._context(state.flow_params, state.log_lambda, state.local_cov)
     keys = random.split(random.PRNGKey(2), 4)
 
     def one(k, x, level, direction):
-        _, x2, level2, direction2 = pipe._jump_ladder(
-            k, x, level, direction, stacked, state.log_lambda
-        )
-        return x2, level2, direction2
+        return ladder_jump(k, x, level, direction, ctx)
 
     xs, levels, directions = jax.vmap(one)(
         keys, state.x, state.levels, state.directions
