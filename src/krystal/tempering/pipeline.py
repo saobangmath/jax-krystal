@@ -32,7 +32,7 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 import optax
-from jax import Array, grad, lax, random
+from jax import Array, lax, random, value_and_grad
 from jax.random import Key
 from tqdm.auto import tqdm
 
@@ -44,6 +44,8 @@ from krystal.tempering.constants import (
     DEFAULT_LOCAL_STEP_SIZE,
     DEFAULT_N_LOCAL,
     DEFAULT_OUTER_ITERATIONS,
+    DEFAULT_PLATEAU_SMOOTHING,
+    DEFAULT_PLATEAU_TOL,
     LOCAL_COV_MIN_POINTS,
     LOCAL_COV_RIDGE,
     OCCUPANCY_PSEUDOCOUNT,
@@ -51,6 +53,7 @@ from krystal.tempering.constants import (
 from krystal.tempering.context import LogProbFn, STContext
 from krystal.tempering.kernels import st_sweep
 from krystal.tempering.state import PipelineState
+from krystal.tempering.stopping import PlateauStopper
 from krystal.transport.base import Transformation
 
 
@@ -137,6 +140,7 @@ class Pipeline:
             opt_states=opt_states,
             counts=jnp.zeros(self.n_levels, dtype=jnp.int32),
             local_cov=local_cov,
+            flow_losses=jnp.full(self.n_edges, jnp.nan, dtype=x0.dtype),
         )
 
     def _stack_flow_params(self, flow_params: list[Any]) -> Any:
@@ -252,6 +256,7 @@ class Pipeline:
         """Fit each edge flow with reverse KL on particles at the source level."""
         flow_params = list(state.flow_params)
         opt_states = list(state.opt_states)
+        flow_losses = state.flow_losses
         levels_np = state.levels
 
         edges = (
@@ -274,14 +279,21 @@ class Pipeline:
                 )
 
             for _ in range(self.learn_steps):
-                grads = grad(loss_fn)(params)
+                loss, grads = value_and_grad(loss_fn)(params)
                 updates, opt_state = self._optimizer.update(grads, opt_state, params)
                 params = optax.apply_updates(params, updates)
 
+            # Loss at the parameters entering the last step (pre-update).
+            flow_losses = flow_losses.at[edge].set(loss)
             flow_params[edge] = params
             opt_states[edge] = opt_state
 
-        return replace(state, flow_params=flow_params, opt_states=opt_states)
+        return replace(
+            state,
+            flow_params=flow_params,
+            opt_states=opt_states,
+            flow_losses=flow_losses,
+        )
 
     def step(
         self,
@@ -303,15 +315,30 @@ class Pipeline:
         n_iterations: int = DEFAULT_OUTER_ITERATIONS,
         progress: bool = True,
         history: list[dict[str, Array]] | None = None,
+        patience: int | None = None,
+        tol: float = DEFAULT_PLATEAU_TOL,
+        smoothing: float = DEFAULT_PLATEAU_SMOOTHING,
     ) -> PipelineState:
-        """Bootstrap from ``key`` / ``x0``, then repeat ``step`` for ``n_iterations``.
+        """Bootstrap from ``key`` / ``x0``, then repeat ``step`` up to ``n_iterations``.
 
         Equivalent to ``init_state`` then the outer train loop. Afterwards
         ``state.flow_params`` / ``state.log_lambda`` are trained. Pass a list
-        as ``history`` to append per-iter ``occupancy`` and ``log_lambda``.
+        as ``history`` to append per-iter ``occupancy``, ``log_lambda``, and
+        ``flow_loss`` (per-edge reverse-KL loss from ``learn_flow``).
+
+        ``n_iterations`` is a cap. If ``patience`` is set, training stops early
+        once the smoothed mean flow loss has not improved by more than ``tol``
+        (relative) for ``patience`` consecutive iterations; see
+        :class:`~krystal.tempering.stopping.PlateauStopper`. With
+        ``patience=None`` (default) it always runs ``n_iterations``.
         """
         if n_iterations < 0:
             raise ValueError("n_iterations must be >= 0")
+        stopper = (
+            PlateauStopper(patience=patience, tol=tol, smoothing=smoothing)
+            if patience is not None
+            else None
+        )
         state = self.init_state(key, x0)
 
         steps = (
@@ -328,6 +355,9 @@ class Pipeline:
                     {
                         "occupancy": state.counts / total,
                         "log_lambda": state.log_lambda,
+                        "flow_loss": state.flow_losses,
                     }
                 )
+            if stopper is not None and stopper.update(state.flow_losses):
+                break
         return state

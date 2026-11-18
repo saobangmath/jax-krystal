@@ -7,7 +7,7 @@ import jax.numpy as jnp
 import pytest
 from jax import random
 
-from krystal.tempering import Pipeline, PipelineState
+from krystal.tempering import Pipeline, PipelineState, PlateauStopper
 from krystal.tempering.kernels import ladder_jump
 from krystal.transport import NICE
 
@@ -190,3 +190,81 @@ def test_update_local_cov_estimates_correlation():
     # Non-identity Σ still runs implement.
     state = pipe.implement(state)
     assert state.x.shape == (64, 2)
+
+
+def test_learn_flow_records_loss_per_edge():
+    pipe = _tiny_pipeline(n_inner=2, learn_steps=3)
+    key = random.PRNGKey(0)
+    state = pipe.init_state(random.PRNGKey(1), random.normal(key, (16, 2)))
+    assert state.flow_losses.shape == (pipe.n_edges,)
+    assert jnp.all(jnp.isnan(state.flow_losses))
+    # All particles at level 0 → only edge 0 is trained and gets a loss.
+    state = pipe.learn_flow(state)
+    assert jnp.isfinite(state.flow_losses[0])
+    assert jnp.all(jnp.isnan(state.flow_losses[1:]))
+
+
+def test_run_history_includes_flow_loss():
+    pipe = _tiny_pipeline(n_inner=4, learn_steps=1)
+    x0 = random.normal(random.PRNGKey(0), (8, 2))
+    history: list = []
+    pipe.run(random.PRNGKey(2), x0, n_iterations=2, progress=False, history=history)
+    assert len(history) == 2
+    assert history[-1]["flow_loss"].shape == (pipe.n_edges,)
+
+
+def test_plateau_stopper_ignores_warmup_nan():
+    stopper = PlateauStopper(patience=1)
+    for _ in range(5):
+        assert not stopper.update(jnp.array([jnp.nan, 1.0]))
+    assert stopper.best is None
+
+
+def test_plateau_stopper_stops_after_patience_without_improvement():
+    stopper = PlateauStopper(patience=3, tol=1e-3, smoothing=0.0)
+    # Steadily improving: never stops.
+    for loss in [10.0, 8.0, 6.0, 4.0]:
+        assert not stopper.update(jnp.array([loss, loss]))
+    # Flat: stops on the 3rd non-improving iteration.
+    assert not stopper.update(jnp.array([4.0, 4.0]))
+    assert not stopper.update(jnp.array([4.0, 4.0]))
+    assert stopper.update(jnp.array([4.0, 4.0]))
+
+
+def test_plateau_stopper_improvement_resets_patience():
+    stopper = PlateauStopper(patience=2, tol=1e-3, smoothing=0.0)
+    stopper.update(jnp.array([5.0]))
+    assert not stopper.update(jnp.array([5.0]))
+    assert not stopper.update(jnp.array([3.0]))  # improved → counter reset
+    assert stopper.bad_iters == 0
+
+
+def test_plateau_stopper_validates_args():
+    with pytest.raises(ValueError, match="patience"):
+        PlateauStopper(patience=0)
+    with pytest.raises(ValueError, match="smoothing"):
+        PlateauStopper(patience=1, smoothing=1.0)
+
+
+def test_run_stops_early_with_patience():
+    pipe = _tiny_pipeline(n_inner=20, learn_steps=1)
+    x0 = random.normal(random.PRNGKey(0), (16, 2))
+    n_max = 30
+    history: list = []
+    # Huge tol → nothing counts as an improvement once all edges have a loss.
+    pipe.run(
+        random.PRNGKey(2),
+        x0,
+        n_iterations=n_max,
+        progress=False,
+        history=history,
+        patience=2,
+        tol=1e9,
+    )
+    assert 0 < len(history) < n_max
+    # Default (patience=None) still runs the full cap.
+    history_full: list = []
+    pipe.run(
+        random.PRNGKey(2), x0, n_iterations=4, progress=False, history=history_full
+    )
+    assert len(history_full) == 4
