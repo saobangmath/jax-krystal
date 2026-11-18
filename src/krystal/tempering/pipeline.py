@@ -21,7 +21,7 @@ keeps ``V`` on accept, and flips ``V`` on MH reject or at a ladder boundary
 (ST analogue of DEO persistence from non-reversible PT).
 
 ``implement`` is pure JAX (``vmap`` over particles, ``lax.scan`` over sweeps)
-so replica chains can be parallelized with ``implement_replicas``.
+so independent chains can be run in parallel by wrapping ``implement`` in ``jax.vmap``.
 """
 
 from __future__ import annotations
@@ -205,57 +205,13 @@ class Pipeline:
             state, x=x, levels=levels, directions=directions, key=key, counts=counts
         )
 
-    def implement_replicas(
-        self,
-        state: PipelineState,
-        keys: Array,
-    ) -> tuple[Array, Array, Array, Array]:
-        """Run independent lifted ST chains in parallel from a shared snapshot.
-
-        Parameters
-        ----------
-        state:
-            Trained ensemble (flows / ``λ`` / ``local_cov`` / positions / ``V``).
-        keys:
-            PRNG keys with shape ``(n_replicas,)`` (typed) or
-            ``(n_replicas, 2)`` (legacy ``PRNGKey``).
-
-        Returns
-        -------
-        xs:
-            ``(n_replicas, n_particles, dim)``
-        levels:
-            ``(n_replicas, n_particles)``
-        directions:
-            ``(n_replicas, n_particles)``
-        counts:
-            ``(n_replicas, n_levels)``
-        """
-        # Typed keys: ``(n_replicas,)``; legacy ``PRNGKey``: ``(n_replicas, 2)``.
-        if keys.ndim == 0 or keys.ndim > 2 or (keys.ndim == 2 and keys.shape[-1] != 2):
-            raise ValueError("keys must have shape (n_replicas,) or (n_replicas, 2)")
-
-        def one_replica(key: Key):
-            _, x, levels, directions, counts = self._run_st(
-                key,
-                state.x,
-                state.levels,
-                state.directions,
-                state.flow_params,
-                state.log_lambda,
-                state.local_cov,
-            )
-            return x, levels, directions, counts
-
-        return jax.vmap(one_replica)(keys)
-
     def update_local_cov(self, state: PipelineState) -> PipelineState:
         """Refresh per-level ``Σ`` from the current particle cloud.
 
         For each ladder level with at least ``LOCAL_COV_MIN_POINTS`` particles,
         set ``Σ`` to the empirical covariance (+ ridge). Levels with too few
         particles keep ``I``. Call this after burn-in / collect when dimensions
-        look correlated, then continue ``implement`` / ``implement_replicas``.
+        look correlated, then continue with ``implement``.
         """
         x = state.x
         levels = state.levels

@@ -128,14 +128,19 @@ def test_step_and_short_run_smoke():
     assert len(state.flow_params) == pipe.n_edges
 
 
-def test_implement_replicas_parallel_collect():
+def test_vmap_implement_parallel_collect():
     pipe = _tiny_pipeline(n_inner=4)
     key = random.PRNGKey(0)
     x0 = random.normal(key, (10, 2))
     state = pipe.init_state(random.PRNGKey(1), x0)
     n_replicas = 3
     keys = random.split(random.PRNGKey(2), n_replicas)
-    xs, levels, directions, counts = pipe.implement_replicas(state, keys)
+
+    def collect(k):
+        out = pipe.implement(replace(state, key=k))
+        return out.x, out.levels, out.directions, out.counts
+
+    xs, levels, directions, counts = jax.jit(jax.vmap(collect))(keys)
     assert xs.shape == (n_replicas, 10, 2)
     assert levels.shape == (n_replicas, 10)
     assert directions.shape == (n_replicas, 10)
