@@ -20,6 +20,9 @@ LOCAL_COV_MIN_POINTS = 2
 DEFAULT_LEARNING_RATE = 1e-3
 DEFAULT_LEARN_STEPS = 1
 
+# Flow objective: "symmetric" = KL(q‖p) + KL(p‖q); "reverse" = KL(q‖p) only.
+DEFAULT_DIVERGENCE = "symmetric"
+
 # Early stopping on the smoothed flow loss (see ``PlateauStopper``).
 DEFAULT_PLATEAU_TOL = 1e-3  # min relative improvement that resets patience
 DEFAULT_PLATEAU_SMOOTHING = 0.9  # EMA coefficient on the mean per-edge loss

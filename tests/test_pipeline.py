@@ -8,6 +8,7 @@ import pytest
 from jax import random
 
 from krystal.tempering import Pipeline, PipelineState, PlateauStopper
+from krystal.tempering.pipeline import edge_loss
 from krystal.tempering.kernels import ladder_jump
 from krystal.transport import NICE
 
@@ -268,3 +269,45 @@ def test_run_stops_early_with_patience():
         random.PRNGKey(2), x0, n_iterations=4, progress=False, history=history_full
     )
     assert len(history_full) == 4
+
+
+def test_edge_loss_zero_when_densities_match():
+    log_q = jnp.array([0.3, -1.2, 0.7])
+    for div in ("reverse", "symmetric"):
+        assert jnp.allclose(edge_loss(log_q, log_q, div), 0.0, atol=1e-6)
+
+
+def test_edge_loss_reverse_matches_definition():
+    log_q = jnp.array([0.0, 1.0])
+    log_p = jnp.array([0.5, -0.5])
+    # mean(log q − log p) = mean([-0.5, 1.5]) = 0.5
+    assert jnp.allclose(edge_loss(log_q, log_p, "reverse"), 0.5)
+
+
+def test_symmetric_edge_loss_invariant_to_constant_offsets():
+    log_q = jnp.array([0.2, -0.4, 1.1, 0.3])
+    log_p = jnp.array([0.9, 0.1, -0.5, 0.4])
+    base = edge_loss(log_q, log_p, "symmetric")
+    # Unknown normalizers in either density cancel in the symmetric objective...
+    assert jnp.allclose(edge_loss(log_q + 3.0, log_p, "symmetric"), base, atol=1e-5)
+    assert jnp.allclose(edge_loss(log_q, log_p - 2.0, "symmetric"), base, atol=1e-5)
+    # ...but shift the reverse objective.
+    rev = edge_loss(log_q, log_p, "reverse")
+    assert jnp.allclose(edge_loss(log_q + 3.0, log_p, "reverse"), rev + 3.0, atol=1e-5)
+
+
+def test_divergence_option_validated():
+    with pytest.raises(ValueError, match="divergence"):
+        edge_loss(jnp.zeros(2), jnp.zeros(2), "forward")
+    with pytest.raises(ValueError, match="divergence"):
+        _tiny_pipeline(divergence="forward")
+
+
+def test_reverse_divergence_pipeline_runs():
+    pipe = _tiny_pipeline(n_inner=2, learn_steps=2, divergence="reverse")
+    state = pipe.init_state(random.PRNGKey(1), random.normal(random.PRNGKey(0), (16, 2)))
+    leaf_before = jax.tree_util.tree_leaves(state.flow_params[0])[0]
+    state = pipe.learn_flow(state)
+    leaf_after = jax.tree_util.tree_leaves(state.flow_params[0])[0]
+    assert not jnp.allclose(leaf_before, leaf_after)
+    assert jnp.isfinite(state.flow_losses[0])

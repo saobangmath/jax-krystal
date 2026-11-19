@@ -37,6 +37,7 @@ from jax.random import Key
 from tqdm.auto import tqdm
 
 from krystal.tempering.constants import (
+    DEFAULT_DIVERGENCE,
     DEFAULT_ETA,
     DEFAULT_INNER_SWEEPS,
     DEFAULT_LEARN_STEPS,
@@ -55,6 +56,33 @@ from krystal.tempering.kernels import st_sweep
 from krystal.tempering.state import PipelineState
 from krystal.tempering.stopping import PlateauStopper
 from krystal.transport.base import Transformation
+
+
+_DIVERGENCES = ("symmetric", "reverse")
+
+
+def edge_loss(log_q: Array, log_p: Array, divergence: str = DEFAULT_DIVERGENCE) -> Array:
+    """Flow objective on a batch of points ``y`` drawn from ``q`` (the pushed-forward source).
+
+    ``log_q`` and ``log_p`` are per-sample log-densities at the same points, and
+    may be unnormalized.
+
+    - ``"reverse"``: ``KL(q ‖ p) = E_q[log q − log p]``.
+    - ``"symmetric"``: ``KL(q ‖ p) + KL(p ‖ q)``. The forward term is estimated
+      by self-normalized importance sampling with weights ``w ∝ p / q``, which
+      gives ``Σ softmax(log w) · log w`` for ``log w = log p − log q``.
+
+    A constant offset in either density (e.g. an unknown normalizer) cancels
+    in the symmetric objective, so its absolute value is meaningful.
+    """
+    if divergence not in _DIVERGENCES:
+        raise ValueError(f"divergence must be one of {_DIVERGENCES}")
+    log_w = log_p - log_q
+    reverse = jnp.mean(-log_w)
+    if divergence == "reverse":
+        return reverse
+    forward = jnp.sum(jax.nn.softmax(log_w) * log_w)
+    return reverse + forward
 
 
 @dataclass
@@ -85,6 +113,8 @@ class Pipeline:
         Gradient steps per edge per ``learn_flow`` call.
     eta:
         Damping for ``log λ`` updates from occupancy.
+    divergence:
+        Flow objective: ``"symmetric"`` (default) or ``"reverse"``. See :func:`edge_loss`.
     """
 
     n_levels: int
@@ -96,6 +126,7 @@ class Pipeline:
     lr: float = DEFAULT_LEARNING_RATE
     learn_steps: int = DEFAULT_LEARN_STEPS
     eta: float = DEFAULT_ETA
+    divergence: str = DEFAULT_DIVERGENCE
     flows: tuple[Transformation, ...] = field(init=False)
     _optimizer: optax.GradientTransformation = field(init=False, repr=False)
 
@@ -106,6 +137,8 @@ class Pipeline:
             raise ValueError("n_inner must be >= 1")
         if self.learn_steps < 1:
             raise ValueError("learn_steps must be >= 1")
+        if self.divergence not in _DIVERGENCES:
+            raise ValueError(f"divergence must be one of {_DIVERGENCES}")
         self.flows = tuple(self.flow for _ in range(self.n_levels - 1))
         self._optimizer = optax.adam(self.lr)
 
@@ -274,9 +307,10 @@ class Pipeline:
 
             def loss_fn(p: Any, batch: Array = x_batch, e: int = edge) -> Array:
                 y, log_det = self.flow.forward(p, batch)
-                return jnp.mean(
-                    self.log_prob(e, batch) - self.log_prob(e + 1, y) - log_det
-                )
+                # Density of y under the pushed-forward source, and the target at y.
+                log_q = self.log_prob(e, batch) - log_det
+                log_p = self.log_prob(e + 1, y)
+                return edge_loss(log_q, log_p, self.divergence)
 
             for _ in range(self.learn_steps):
                 loss, grads = value_and_grad(loss_fn)(params)
