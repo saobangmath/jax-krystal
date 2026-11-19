@@ -7,7 +7,8 @@ import jax.numpy as jnp
 import pytest
 from jax import random
 
-from krystal.tempering import Pipeline, PipelineState
+from krystal.tempering import Pipeline, PipelineState, PlateauStopper
+from krystal.tempering.pipeline import edge_loss
 from krystal.tempering.kernels import ladder_jump
 from krystal.transport import NICE
 
@@ -190,3 +191,123 @@ def test_update_local_cov_estimates_correlation():
     # Non-identity Σ still runs implement.
     state = pipe.implement(state)
     assert state.x.shape == (64, 2)
+
+
+def test_learn_flow_records_loss_per_edge():
+    pipe = _tiny_pipeline(n_inner=2, learn_steps=3)
+    key = random.PRNGKey(0)
+    state = pipe.init_state(random.PRNGKey(1), random.normal(key, (16, 2)))
+    assert state.flow_losses.shape == (pipe.n_edges,)
+    assert jnp.all(jnp.isnan(state.flow_losses))
+    # All particles at level 0 → only edge 0 is trained and gets a loss.
+    state = pipe.learn_flow(state)
+    assert jnp.isfinite(state.flow_losses[0])
+    assert jnp.all(jnp.isnan(state.flow_losses[1:]))
+
+
+def test_run_history_includes_flow_loss():
+    pipe = _tiny_pipeline(n_inner=4, learn_steps=1)
+    x0 = random.normal(random.PRNGKey(0), (8, 2))
+    history: list = []
+    pipe.run(random.PRNGKey(2), x0, n_iterations=2, progress=False, history=history)
+    assert len(history) == 2
+    assert history[-1]["flow_loss"].shape == (pipe.n_edges,)
+
+
+def test_plateau_stopper_ignores_warmup_nan():
+    stopper = PlateauStopper(patience=1)
+    for _ in range(5):
+        assert not stopper.update(jnp.array([jnp.nan, 1.0]))
+    assert stopper.best is None
+
+
+def test_plateau_stopper_stops_after_patience_without_improvement():
+    stopper = PlateauStopper(patience=3, tol=1e-3, smoothing=0.0)
+    # Steadily improving: never stops.
+    for loss in [10.0, 8.0, 6.0, 4.0]:
+        assert not stopper.update(jnp.array([loss, loss]))
+    # Flat: stops on the 3rd non-improving iteration.
+    assert not stopper.update(jnp.array([4.0, 4.0]))
+    assert not stopper.update(jnp.array([4.0, 4.0]))
+    assert stopper.update(jnp.array([4.0, 4.0]))
+
+
+def test_plateau_stopper_improvement_resets_patience():
+    stopper = PlateauStopper(patience=2, tol=1e-3, smoothing=0.0)
+    stopper.update(jnp.array([5.0]))
+    assert not stopper.update(jnp.array([5.0]))
+    assert not stopper.update(jnp.array([3.0]))  # improved → counter reset
+    assert stopper.bad_iters == 0
+
+
+def test_plateau_stopper_validates_args():
+    with pytest.raises(ValueError, match="patience"):
+        PlateauStopper(patience=0)
+    with pytest.raises(ValueError, match="smoothing"):
+        PlateauStopper(patience=1, smoothing=1.0)
+
+
+def test_run_stops_early_with_patience():
+    pipe = _tiny_pipeline(n_inner=20, learn_steps=1)
+    x0 = random.normal(random.PRNGKey(0), (16, 2))
+    n_max = 30
+    history: list = []
+    # Huge tol → nothing counts as an improvement once all edges have a loss.
+    pipe.run(
+        random.PRNGKey(2),
+        x0,
+        n_iterations=n_max,
+        progress=False,
+        history=history,
+        patience=2,
+        tol=1e9,
+    )
+    assert 0 < len(history) < n_max
+    # Default (patience=None) still runs the full cap.
+    history_full: list = []
+    pipe.run(
+        random.PRNGKey(2), x0, n_iterations=4, progress=False, history=history_full
+    )
+    assert len(history_full) == 4
+
+
+def test_edge_loss_zero_when_densities_match():
+    log_q = jnp.array([0.3, -1.2, 0.7])
+    for div in ("reverse", "symmetric"):
+        assert jnp.allclose(edge_loss(log_q, log_q, div), 0.0, atol=1e-6)
+
+
+def test_edge_loss_reverse_matches_definition():
+    log_q = jnp.array([0.0, 1.0])
+    log_p = jnp.array([0.5, -0.5])
+    # mean(log q − log p) = mean([-0.5, 1.5]) = 0.5
+    assert jnp.allclose(edge_loss(log_q, log_p, "reverse"), 0.5)
+
+
+def test_symmetric_edge_loss_invariant_to_constant_offsets():
+    log_q = jnp.array([0.2, -0.4, 1.1, 0.3])
+    log_p = jnp.array([0.9, 0.1, -0.5, 0.4])
+    base = edge_loss(log_q, log_p, "symmetric")
+    # Unknown normalizers in either density cancel in the symmetric objective...
+    assert jnp.allclose(edge_loss(log_q + 3.0, log_p, "symmetric"), base, atol=1e-5)
+    assert jnp.allclose(edge_loss(log_q, log_p - 2.0, "symmetric"), base, atol=1e-5)
+    # ...but shift the reverse objective.
+    rev = edge_loss(log_q, log_p, "reverse")
+    assert jnp.allclose(edge_loss(log_q + 3.0, log_p, "reverse"), rev + 3.0, atol=1e-5)
+
+
+def test_divergence_option_validated():
+    with pytest.raises(ValueError, match="divergence"):
+        edge_loss(jnp.zeros(2), jnp.zeros(2), "forward")
+    with pytest.raises(ValueError, match="divergence"):
+        _tiny_pipeline(divergence="forward")
+
+
+def test_reverse_divergence_pipeline_runs():
+    pipe = _tiny_pipeline(n_inner=2, learn_steps=2, divergence="reverse")
+    state = pipe.init_state(random.PRNGKey(1), random.normal(random.PRNGKey(0), (16, 2)))
+    leaf_before = jax.tree_util.tree_leaves(state.flow_params[0])[0]
+    state = pipe.learn_flow(state)
+    leaf_after = jax.tree_util.tree_leaves(state.flow_params[0])[0]
+    assert not jnp.allclose(leaf_before, leaf_after)
+    assert jnp.isfinite(state.flow_losses[0])

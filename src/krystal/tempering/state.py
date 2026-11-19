@@ -46,6 +46,13 @@ class PipelineState:
     :meth:`Pipeline.update_local_cov` after particles have mixed.
     """
 
+    flow_losses: Array
+    """Last reverse-KL loss per edge from ``learn_flow``, shape ``(n_levels - 1,)``.
+
+    Entries keep their previous value for edges that had no particles.
+    Initialized to NaN before the first ``learn_flow``.
+    """
+
     def tree_flatten(self):
         children = (
             self.x,
@@ -57,6 +64,7 @@ class PipelineState:
             self.opt_states,
             self.counts,
             self.local_cov,
+            self.flow_losses,
         )
         return children, None
 
