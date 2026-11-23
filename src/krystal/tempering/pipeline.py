@@ -8,12 +8,15 @@ One outer iteration (``Pipeline.step``) has three stages:
 
 Where things live:
 
-- ``context.py`` — ``STContext``, the read-only inputs shared by every sweep.
+- ``context.py`` — ``STContext`` (unchanging settings) and ``SweepInputs``
+  (frozen arrays for one ``implement``, including ``chol(local_cov)``).
 - ``kernels.py`` — the per-particle moves (random-walk MH, lifted ladder jump)
   and ``st_sweep``, which ``vmap``s them over all particles.
-- ``state.py`` — ``PipelineState``, the data carried between stages.
+- ``state.py`` — ``PipelineState``, the data that changes between stages
+  (including ``local_cov``, the single stored form of ``Σ``).
 - this file — the orchestration: ``implement`` scans ``st_sweep`` over
-  ``n_inner`` sweeps; ``tune_weight`` / ``learn_flow`` are the two updates.
+  ``n_inner`` sweeps; ``update_local_cov`` / ``tune_weight`` / ``learn_flow``
+  are the updates.
 
 Ladder jumps use a **lifted / non-reversible** kernel: each particle carries a
 persistent direction ``V ∈ {+1, -1}``, always proposes ``I → I + V`` (with flow),
@@ -48,7 +51,7 @@ from krystal.tempering.constants import (
     LOCAL_COV_RIDGE,
     OCCUPANCY_PSEUDOCOUNT,
 )
-from krystal.tempering.context import LogProbFn, STContext
+from krystal.tempering.context import LogProbFn, STContext, SweepInputs
 from krystal.tempering.kernels import st_sweep
 from krystal.tempering.state import PipelineState
 from krystal.transport.base import Transformation
@@ -79,7 +82,8 @@ class Pipeline:
     lr:
         Adam learning rate for ``learn_flow``.
     learn_steps:
-        Gradient steps per edge per ``learn_flow`` call.
+        Joint gradient steps per ``learn_flow`` call; each updates every edge
+        that has particles at its source level.
     eta:
         Damping for ``log λ`` updates from occupancy.
     """
@@ -146,16 +150,21 @@ class Pipeline:
         """
         return jax.tree.map(lambda *xs: jnp.stack(xs, axis=0), *flow_params)
 
-    def _context(
-        self, flow_params: list[Any], log_lambda: Array, local_cov: Array
-    ) -> STContext:
-        """Freeze the current flows / ``λ`` / ``Σ`` plus settings for the kernels."""
+    def _st_context(self) -> STContext:
+        """Unchanging settings for the kernels (same for every outer iteration)."""
         return STContext(
             flow=self.flow,
             log_prob=self.log_prob,
             n_levels=self.n_levels,
             step_size=self.local_step_size,
             n_local=self.n_local,
+        )
+
+    def _sweep_inputs(
+        self, flow_params: list[Any], log_lambda: Array, local_cov: Array
+    ) -> SweepInputs:
+        """Snapshot changing arrays for one ``implement``; derive ``chol(Σ)``."""
+        return SweepInputs(
             stacked_params=self._stack_flow_params(flow_params),
             log_lambda=log_lambda,
             cov_chols=jnp.linalg.cholesky(local_cov),
@@ -176,12 +185,13 @@ class Pipeline:
         Returns ``(key, x, levels, directions, counts)`` where ``counts`` sums
         the per-sweep level visits, shape ``(n_levels,)``.
         """
-        ctx = self._context(flow_params, log_lambda, local_cov)
+        ctx = self._st_context()
+        sweep = self._sweep_inputs(flow_params, log_lambda, local_cov)
 
         def one_sweep(carry, _):
             key, x, levels, directions = carry
             key, x, levels, directions, visits = st_sweep(
-                key, x, levels, directions, ctx
+                key, x, levels, directions, ctx, sweep
             )
             return (key, x, levels, directions), visits
 
@@ -210,8 +220,8 @@ class Pipeline:
 
         For each ladder level with at least ``LOCAL_COV_MIN_POINTS`` particles,
         set ``Σ`` to the empirical covariance (+ ridge). Levels with too few
-        particles keep ``I``. Call this after burn-in / collect when dimensions
-        look correlated, then continue with ``implement``.
+        particles keep ``I``. Called automatically after ``implement`` in
+        :meth:`step`. Only ``local_cov`` is stored; Cholesky is derived later.
         """
         x = state.x
         levels = state.levels
@@ -249,37 +259,56 @@ class Pipeline:
         *,
         progress: bool = False,
     ) -> PipelineState:
-        """Fit each edge flow with reverse KL on particles at the source level."""
+        """Fit all edge flows jointly with reverse KL on particles at each source level.
+
+        Each of the ``learn_steps`` steps takes one gradient of the *sum* of the
+        per-edge losses and updates every edge that has particles at once.
+        Edges with no particles at their source level are skipped entirely
+        (parameters and optimizer state untouched).
+
+        Each edge loss depends only on that edge's parameters, so the joint
+        gradient equals the per-edge gradients; the edges are updated together,
+        not coupled. Adam is elementwise, so keeping one optimizer state per edge
+        is equivalent to a single Adam over all parameters.
+        """
         flow_params = list(state.flow_params)
         opt_states = list(state.opt_states)
-        levels_np = state.levels
 
-        edges = (
-            range(self.n_edges)
-            if not progress
-            else tqdm(range(self.n_edges), desc="learn_flow", leave=False)
-        )
-        for edge in edges:
-            mask = levels_np == edge
-            if not bool(jnp.any(mask)):
-                continue
-            x_batch = state.x[mask]
-            params = flow_params[edge]
-            opt_state = opt_states[edge]
+        active: list[int] = []
+        batches: list[Array] = []
+        for edge in range(self.n_edges):
+            mask = state.levels == edge
+            if bool(jnp.any(mask)):
+                active.append(edge)
+                batches.append(state.x[mask])
+        if not active:
+            return state
 
-            def loss_fn(p: Any, batch: Array = x_batch, e: int = edge) -> Array:
-                y, log_det = self.flow.forward(p, batch)
-                return jnp.mean(
-                    self.log_prob(e, batch) - self.log_prob(e + 1, y) - log_det
+        def total_loss(params_list: list[Any]) -> Array:
+            total = jnp.zeros(())
+            for edge, params, batch in zip(active, params_list, batches):
+                y, log_det = self.flow.forward(params, batch)
+                total = total + jnp.mean(
+                    self.log_prob(edge, batch) - self.log_prob(edge + 1, y) - log_det
                 )
+            return total
 
-            for _ in range(self.learn_steps):
-                grads = grad(loss_fn)(params)
-                updates, opt_state = self._optimizer.update(grads, opt_state, params)
-                params = optax.apply_updates(params, updates)
+        params_list = [flow_params[edge] for edge in active]
+        steps = (
+            range(self.learn_steps)
+            if not progress
+            else tqdm(range(self.learn_steps), desc="learn_flow", leave=False)
+        )
+        for _ in steps:
+            grads = grad(total_loss)(params_list)
+            for i, edge in enumerate(active):
+                updates, opt_states[edge] = self._optimizer.update(
+                    grads[i], opt_states[edge], params_list[i]
+                )
+                params_list[i] = optax.apply_updates(params_list[i], updates)
 
+        for edge, params in zip(active, params_list):
             flow_params[edge] = params
-            opt_states[edge] = opt_state
 
         return replace(state, flow_params=flow_params, opt_states=opt_states)
 
@@ -289,8 +318,9 @@ class Pipeline:
         *,
         progress: bool = False,
     ) -> PipelineState:
-        """One outer iteration: implement → tune weight → learn flow."""
+        """One outer iteration: implement → update Σ → tune weight → learn flow."""
         state = self.implement(state)
+        state = self.update_local_cov(state)
         state = self.tune_weight(state)
         state = self.learn_flow(state, progress=progress)
         return state
