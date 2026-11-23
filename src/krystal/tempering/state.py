@@ -42,8 +42,10 @@ class PipelineState:
     local_cov: Array
     """Per-level RW proposal covariance ``Σ``, shape ``(n_levels, dim, dim)``.
 
-    Gelman proposal is ``N(x, (2.38² / d) Σ)``. Starts as ``I``; refresh with
-    :meth:`Pipeline.update_local_cov` after particles have mixed.
+    Single source of truth for the proposal shape. Gelman proposal is
+    ``N(x, (2.38² / d) Σ)``. Starts as ``I``; :meth:`Pipeline.update_local_cov`
+    refreshes it from the particle cloud. Kernels use ``chol(Σ)`` derived into
+    :class:`~krystal.tempering.context.SweepInputs` for one ``implement``.
     """
 
     def tree_flatten(self):

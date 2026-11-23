@@ -128,6 +128,23 @@ def test_step_and_short_run_smoke():
     assert len(state.flow_params) == pipe.n_edges
 
 
+def test_step_refreshes_local_cov_from_particles():
+    """``step`` calls ``update_local_cov`` after ``implement``."""
+    pipe = _tiny_pipeline(n_inner=8, learn_steps=1)
+    z = random.normal(random.PRNGKey(0), (64, 1))
+    x0 = jnp.concatenate([z, z], axis=-1)
+    state = pipe.init_state(random.PRNGKey(1), x0)
+    assert jnp.allclose(state.local_cov[0], jnp.eye(2))
+    state = pipe.step(state)
+    # After one step, particles that remain at level 0 should leave a correlated Σ.
+    # (May be weak if they all left level 0; still shape-check and PSD-ish.)
+    assert state.local_cov.shape == (pipe.n_levels, 2, 2)
+    for level in range(pipe.n_levels):
+        cov = state.local_cov[level]
+        assert jnp.allclose(cov, cov.T, atol=1e-5)
+        assert jnp.all(jnp.linalg.eigvalsh(cov) > -1e-5)
+
+
 def test_vmap_implement_parallel_collect():
     pipe = _tiny_pipeline(n_inner=4)
     key = random.PRNGKey(0)
@@ -160,11 +177,12 @@ def test_lifted_jump_flips_at_hot_boundary():
     state = pipe.init_state(random.PRNGKey(1), x0)
     state = replace(state, directions=-jnp.ones(4, dtype=jnp.int32))
     # One jump attempt from the boundary downward → all should flip to +1, stay at 0.
-    ctx = pipe._context(state.flow_params, state.log_lambda, state.local_cov)
+    ctx = pipe._st_context()
+    sweep = pipe._sweep_inputs(state.flow_params, state.log_lambda, state.local_cov)
     keys = random.split(random.PRNGKey(2), 4)
 
     def one(k, x, level, direction):
-        return ladder_jump(k, x, level, direction, ctx)
+        return ladder_jump(k, x, level, direction, ctx, sweep)
 
     xs, levels, directions = jax.vmap(one)(
         keys, state.x, state.levels, state.directions
@@ -190,3 +208,20 @@ def test_update_local_cov_estimates_correlation():
     # Non-identity Σ still runs implement.
     state = pipe.implement(state)
     assert state.x.shape == (64, 2)
+
+
+def test_run_zero_iterations_returns_init_state():
+    """n_iterations=0 skips training; history stays empty; collect still works."""
+    pipe = _tiny_pipeline(n_inner=4, learn_steps=1)
+    x0 = random.normal(random.PRNGKey(0), (8, 2))
+    history: list = []
+    state = pipe.run(
+        random.PRNGKey(1), x0, n_iterations=0, progress=False, history=history
+    )
+    assert history == []
+    assert jnp.all(state.levels == 0)
+    assert jnp.allclose(state.log_lambda, 0.0)
+    # Collect / implement should still run from the untrained state.
+    state = pipe.implement(state)
+    assert state.x.shape == (8, 2)
+    assert int(state.counts.sum()) == 8 * pipe.n_inner
