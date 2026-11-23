@@ -29,13 +29,12 @@ def rw_metropolis(
 ) -> Array:
     """Run ``ctx.n_local`` random-walk MH steps targeting ``π_level``.
 
-    Proposal: ``x' = x + step_size · (2.38 / √d) · chol @ ε`` with
-    ``ε ~ N(0, I)`` and ``Σ_level = chol cholᵀ``. For ``step_size = 1`` this is
-    ``N(x, (2.38² / d) Σ_level)``. The proposal is symmetric, so the MH ratio is
-    just ``π_level(x') / π_level(x)``.
+    Proposal: ``x' = x + (2.38 / √d) · chol @ ε`` with ``ε ~ N(0, I)`` and
+    ``Σ_level = chol cholᵀ``, i.e. ``N(x, (2.38² / d) Σ_level)``. The proposal
+    is symmetric, so the MH ratio is just ``π_level(x') / π_level(x)``.
     """
     dim = x.shape[-1]
-    scale = ctx.step_size * RW_MH_OPTIMAL_SCALE / jnp.sqrt(dim)
+    scale = RW_MH_OPTIMAL_SCALE / jnp.sqrt(dim)
     chol = sweep.cov_chols[level]
 
     def one_step(x: Array, step_key: Key) -> tuple[Array, None]:

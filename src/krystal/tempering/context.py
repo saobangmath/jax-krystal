@@ -22,7 +22,7 @@ class STContext:
 
     - ``flow`` / ``log_prob``: transport map and per-level log-density.
     - ``n_levels``: ladder size ``T``.
-    - ``step_size`` / ``n_local``: RW-MH scale multiplier and steps per sweep.
+    - ``n_local``: random-walk MH steps per sweep.
 
     Arrays that *do* change between outer iterations (``log_lambda``, flow
     params, ``local_cov``) live on :class:`~krystal.tempering.state.PipelineState`.
@@ -32,7 +32,6 @@ class STContext:
     flow: Transformation
     log_prob: LogProbFn
     n_levels: int
-    step_size: float
     n_local: int
 
 
