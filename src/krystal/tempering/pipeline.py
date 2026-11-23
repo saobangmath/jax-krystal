@@ -258,14 +258,8 @@ class Pipeline:
         """Fit all edge flows jointly with reverse KL on particles at each source level.
 
         Each of the ``learn_steps`` steps takes one gradient of the *sum* of the
-        per-edge losses and updates every edge that has particles at once.
-        Edges with no particles at their source level are skipped entirely
-        (parameters and optimizer state untouched).
-
-        Each edge loss depends only on that edge's parameters, so the joint
-        gradient equals the per-edge gradients; the edges are updated together,
-        not coupled. Adam is elementwise, so keeping one optimizer state per edge
-        is equivalent to a single Adam over all parameters.
+        per-edge losses, then applies Adam only to edges that have particles.
+        Inactive edges keep their params and optimizer state untouched.
         """
         flow_params = list(state.flow_params)
         opt_states = list(state.opt_states)
