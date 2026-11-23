@@ -11,7 +11,6 @@ DEFAULT_N_LOCAL = 1
 # Gelman et al.: proposal ~ N(x, (2.38² / d) Σ), with Σ the (per-level) target
 # covariance. Σ = I recovers the isotropic scale 2.38 / sqrt(d).
 RW_MH_OPTIMAL_SCALE = 2.38
-DEFAULT_LOCAL_STEP_SIZE = 1.0  # multiplier on the Gelman factor 2.38 / sqrt(d)
 # Ridge added when forming empirical Σ (and when <2 particles at a level → I).
 LOCAL_COV_RIDGE = 1e-6
 LOCAL_COV_MIN_POINTS = 2

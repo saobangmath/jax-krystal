@@ -44,7 +44,6 @@ from krystal.tempering.constants import (
     DEFAULT_INNER_SWEEPS,
     DEFAULT_LEARN_STEPS,
     DEFAULT_LEARNING_RATE,
-    DEFAULT_LOCAL_STEP_SIZE,
     DEFAULT_N_LOCAL,
     DEFAULT_OUTER_ITERATIONS,
     LOCAL_COV_MIN_POINTS,
@@ -75,10 +74,9 @@ class Pipeline:
         ST sweeps inside each ``implement`` call.
     n_local:
         Random-walk MH steps within the current level per particle per sweep.
-    local_step_size:
-        Multiplier on the Gelman factor ``2.38 / sqrt(d)``. With per-level
-        covariance ``Σ`` on :class:`PipelineState`, the proposal is
-        ``N(x, (2.38² / d) Σ)`` (``Σ = I`` until ``update_local_cov``).
+        Proposal scale is the Gelman factor ``2.38 / sqrt(d)`` with per-level
+        covariance ``Σ`` on :class:`PipelineState` (``Σ = I`` until
+        ``update_local_cov``).
     lr:
         Adam learning rate for ``learn_flow``.
     learn_steps:
@@ -93,7 +91,6 @@ class Pipeline:
     log_prob: LogProbFn
     n_inner: int = DEFAULT_INNER_SWEEPS
     n_local: int = DEFAULT_N_LOCAL
-    local_step_size: float = DEFAULT_LOCAL_STEP_SIZE
     lr: float = DEFAULT_LEARNING_RATE
     learn_steps: int = DEFAULT_LEARN_STEPS
     eta: float = DEFAULT_ETA
@@ -156,7 +153,6 @@ class Pipeline:
             flow=self.flow,
             log_prob=self.log_prob,
             n_levels=self.n_levels,
-            step_size=self.local_step_size,
             n_local=self.n_local,
         )
 
@@ -262,14 +258,8 @@ class Pipeline:
         """Fit all edge flows jointly with reverse KL on particles at each source level.
 
         Each of the ``learn_steps`` steps takes one gradient of the *sum* of the
-        per-edge losses and updates every edge that has particles at once.
-        Edges with no particles at their source level are skipped entirely
-        (parameters and optimizer state untouched).
-
-        Each edge loss depends only on that edge's parameters, so the joint
-        gradient equals the per-edge gradients; the edges are updated together,
-        not coupled. Adam is elementwise, so keeping one optimizer state per edge
-        is equivalent to a single Adam over all parameters.
+        per-edge losses, then applies Adam only to edges that have particles.
+        Inactive edges keep their params and optimizer state untouched.
         """
         flow_params = list(state.flow_params)
         opt_states = list(state.opt_states)
