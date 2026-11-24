@@ -25,8 +25,9 @@ class STContext:
     - ``n_local``: random-walk MH steps per sweep.
 
     Arrays that *do* change between outer iterations (``log_lambda``, flow
-    params, ``local_cov``) live on :class:`~krystal.tempering.state.PipelineState`.
-    For one ``implement`` call they are snapshotted into :class:`SweepInputs`.
+    params, ``local_cov`` stats) live on
+    :class:`~krystal.tempering.state.PipelineState`. For one ``implement`` call
+    they are snapshotted into :class:`SweepInputs`.
     """
 
     flow: Transformation
@@ -43,8 +44,9 @@ class SweepInputs:
 
     - ``stacked_params``: flow params stacked on a leading edge axis.
     - ``log_lambda``: log ST weights, shape ``(n_levels,)``.
-    - ``cov_chols``: ``chol(local_cov)`` per level — derived from state, not
-      stored separately. Shape ``(n_levels, d, d)``.
+    - ``cov_chols``: ``chol(local_cov.cov)`` per level — derived from
+      :class:`~krystal.tempering.state.LocalCovState`, not stored separately.
+      Shape ``(n_levels, d, d)``.
     """
 
     stacked_params: Any

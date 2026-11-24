@@ -5,9 +5,51 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+import jax.numpy as jnp
 from jax import Array
 from jax.random import Key
 from jax.tree_util import register_pytree_node_class
+
+
+@register_pytree_node_class
+@dataclass
+class LocalCovState:
+    """Per-level Welford stats and the derived RW proposal covariance.
+
+    Fixed-size summaries only — no particle history. ``cov`` is
+    ``M2 / (n - 1) + ridge`` when ``n >= 2``, otherwise ``I``.
+    """
+
+    n: Array
+    """Sample count per level, shape ``(n_levels,)``."""
+
+    mean: Array
+    """Running mean per level, shape ``(n_levels, dim)``."""
+
+    m2: Array
+    """Sum of squared deviations ``M2`` per level, shape ``(n_levels, dim, dim)``."""
+
+    cov: Array
+    """Proposal covariance ``Σ`` per level, shape ``(n_levels, dim, dim)``."""
+
+    @classmethod
+    def init(cls, n_levels: int, dim: int, dtype=jnp.float32) -> LocalCovState:
+        """Cold start: empty Welford stats and isotropic ``Σ = I``."""
+        eye = jnp.eye(dim, dtype=dtype)
+        return cls(
+            n=jnp.zeros(n_levels, dtype=dtype),
+            mean=jnp.zeros((n_levels, dim), dtype=dtype),
+            m2=jnp.zeros((n_levels, dim, dim), dtype=dtype),
+            cov=jnp.broadcast_to(eye, (n_levels, dim, dim)).copy(),
+        )
+
+    def tree_flatten(self):
+        return (self.n, self.mean, self.m2, self.cov), None
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        del aux_data
+        return cls(*children)
 
 
 @register_pytree_node_class
@@ -39,14 +81,8 @@ class PipelineState:
     counts: Array
     """Visit counts from the last ``implement`` call, shape ``(n_levels,)``."""
 
-    local_cov: Array
-    """Per-level RW proposal covariance ``Σ``, shape ``(n_levels, dim, dim)``.
-
-    Single source of truth for the proposal shape. Gelman proposal is
-    ``N(x, (2.38² / d) Σ)``. Starts as ``I``; :meth:`Pipeline.update_local_cov`
-    refreshes it from the particle cloud. Kernels use ``chol(Σ)`` derived into
-    :class:`~krystal.tempering.context.SweepInputs` for one ``implement``.
-    """
+    local_cov: LocalCovState
+    """Welford adaptive proposal covariance (stats + derived ``Σ``)."""
 
     def tree_flatten(self):
         children = (

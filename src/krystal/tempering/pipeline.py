@@ -13,7 +13,7 @@ Where things live:
 - ``kernels.py`` — the per-particle moves (random-walk MH, lifted ladder jump)
   and ``st_sweep``, which ``vmap``s them over all particles.
 - ``state.py`` — ``PipelineState``, the data that changes between stages
-  (including ``local_cov``, the single stored form of ``Σ``).
+  (including Welford stats and derived ``local_cov``).
 - this file — the orchestration: ``implement`` scans ``st_sweep`` over
   ``n_inner`` sweeps; ``update_local_cov`` / ``tune_weight`` / ``learn_flow``
   are the updates.
@@ -52,7 +52,7 @@ from krystal.tempering.constants import (
 )
 from krystal.tempering.context import LogProbFn, STContext, SweepInputs
 from krystal.tempering.kernels import st_sweep
-from krystal.tempering.state import PipelineState
+from krystal.tempering.state import LocalCovState, PipelineState
 from krystal.transport.base import Transformation
 
 
@@ -124,9 +124,6 @@ class Pipeline:
         ]
         opt_states = [self._optimizer.init(p) for p in flow_params]
         dim = x0.shape[1]
-        local_cov = jnp.broadcast_to(
-            jnp.eye(dim, dtype=x0.dtype), (self.n_levels, dim, dim)
-        ).copy()
         return PipelineState(
             x=x0,
             levels=jnp.zeros(n_particles, dtype=jnp.int32),
@@ -137,7 +134,7 @@ class Pipeline:
             key=keys[-1],
             opt_states=opt_states,
             counts=jnp.zeros(self.n_levels, dtype=jnp.int32),
-            local_cov=local_cov,
+            local_cov=LocalCovState.init(self.n_levels, dim, dtype=x0.dtype),
         )
 
     def _stack_flow_params(self, flow_params: list[Any]) -> Any:
@@ -205,39 +202,69 @@ class Pipeline:
             state.directions,
             state.flow_params,
             state.log_lambda,
-            state.local_cov,
+            state.local_cov.cov,
         )
         return replace(
             state, x=x, levels=levels, directions=directions, key=key, counts=counts
         )
 
     def update_local_cov(self, state: PipelineState) -> PipelineState:
-        """Refresh per-level ``Σ`` from the current particle cloud.
+        """Merge the current particle cloud into per-level Welford stats.
 
-        For each ladder level with at least ``LOCAL_COV_MIN_POINTS`` particles,
-        set ``Σ`` to the empirical covariance (+ ridge). Levels with too few
-        particles keep ``I``. Called automatically after ``implement`` in
-        :meth:`step`. Only ``local_cov`` is stored; Cholesky is derived later.
+        For each level with at least ``LOCAL_COV_MIN_POINTS`` particles, fold
+        that batch into :class:`~krystal.tempering.state.LocalCovState` with
+        Chan's parallel update (no particle history stored). Then set::
+
+            cov = M2 / (n - 1) + ridge · I   if n >= 2 else I
+
+        Sparse levels leave their Welford stats unchanged. Called after
+        ``implement`` in :meth:`step`.
         """
         x = state.x
         levels = state.levels
+        prev = state.local_cov
         dim = x.shape[-1]
         eye = jnp.eye(dim, dtype=x.dtype)
         ridge = LOCAL_COV_RIDGE * eye
         min_points = LOCAL_COV_MIN_POINTS
         n_levels = self.n_levels
 
-        def cov_for_level(level: Array) -> Array:
+        def merge_level(level: Array) -> tuple[Array, Array, Array, Array]:
             mask = levels == level
-            n = jnp.sum(mask)
+            n_b = jnp.sum(mask).astype(x.dtype)
             x_sum = jnp.sum(jnp.where(mask[:, None], x, 0.0), axis=0)
-            mean = x_sum / jnp.maximum(n, 1)
-            xc = jnp.where(mask[:, None], x - mean, 0.0)
-            cov = (xc.T @ xc) / jnp.maximum(n - 1, 1) + ridge
-            return jnp.where(n >= min_points, cov, eye)
+            mean_b = x_sum / jnp.maximum(n_b, 1.0)
+            xc = jnp.where(mask[:, None], x - mean_b, 0.0)
+            m2_b = xc.T @ xc
 
-        local_cov = jax.vmap(cov_for_level)(jnp.arange(n_levels))
-        return replace(state, local_cov=local_cov)
+            n_a = prev.n[level]
+            mean_a = prev.mean[level]
+            m2_a = prev.m2[level]
+
+            n = n_a + n_b
+            delta = mean_b - mean_a
+            # Chan merge; if n_a == 0 this reduces to the batch stats.
+            mean = mean_a + delta * (n_b / jnp.maximum(n, 1.0))
+            m2 = m2_a + m2_b + jnp.outer(delta, delta) * (
+                n_a * n_b / jnp.maximum(n, 1.0)
+            )
+
+            use_batch = n_b >= min_points
+            n_new = jnp.where(use_batch, n, n_a)
+            mean_new = jnp.where(use_batch, mean, mean_a)
+            m2_new = jnp.where(use_batch, m2, m2_a)
+            cov = jnp.where(
+                n_new >= 2.0,
+                m2_new / jnp.maximum(n_new - 1.0, 1.0) + ridge,
+                eye,
+            )
+            return n_new, mean_new, m2_new, cov
+
+        n, mean, m2, cov = jax.vmap(merge_level)(jnp.arange(n_levels))
+        return replace(
+            state,
+            local_cov=LocalCovState(n=n, mean=mean, m2=m2, cov=cov),
+        )
 
     def tune_weight(self, state: PipelineState) -> PipelineState:
         """Update ``log λ`` from occupancy counts collected in ``implement``."""
