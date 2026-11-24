@@ -11,8 +11,9 @@ DEFAULT_N_LOCAL = 1
 # Gelman et al.: proposal ~ N(x, (2.38² / d) Σ), with Σ the (per-level) target
 # covariance. Σ = I recovers the isotropic scale 2.38 / sqrt(d).
 RW_MH_OPTIMAL_SCALE = 2.38
-# Ridge added when forming empirical Σ (and when <2 particles at a level → I).
+# Ridge added when forming Σ = M2/(n-1) + ridge·I from Welford stats.
 LOCAL_COV_RIDGE = 1e-6
+# Skip merging a level's batch into Welford stats if fewer particles than this.
 LOCAL_COV_MIN_POINTS = 2
 
 # Flow training (Adam).

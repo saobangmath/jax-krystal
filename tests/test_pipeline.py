@@ -72,8 +72,12 @@ def test_init_state_at_level_zero():
     assert jnp.all(state.directions == 1)
     assert len(state.flow_params) == pipe.n_edges
     assert state.log_lambda.shape == (pipe.n_levels,)
-    assert state.local_cov.shape == (pipe.n_levels, 2, 2)
-    assert jnp.allclose(state.local_cov[0], jnp.eye(2))
+    assert state.local_cov.cov.shape == (pipe.n_levels, 2, 2)
+    assert jnp.allclose(state.local_cov.cov[0], jnp.eye(2))
+    assert state.local_cov.n.shape == (pipe.n_levels,)
+    assert jnp.allclose(state.local_cov.n, 0.0)
+    assert state.local_cov.mean.shape == (pipe.n_levels, 2)
+    assert state.local_cov.m2.shape == (pipe.n_levels, 2, 2)
 
 
 def test_implement_updates_counts_and_preserves_shape():
@@ -134,13 +138,13 @@ def test_step_refreshes_local_cov_from_particles():
     z = random.normal(random.PRNGKey(0), (64, 1))
     x0 = jnp.concatenate([z, z], axis=-1)
     state = pipe.init_state(random.PRNGKey(1), x0)
-    assert jnp.allclose(state.local_cov[0], jnp.eye(2))
+    assert jnp.allclose(state.local_cov.cov[0], jnp.eye(2))
     state = pipe.step(state)
     # After one step, particles that remain at level 0 should leave a correlated Σ.
     # (May be weak if they all left level 0; still shape-check and PSD-ish.)
-    assert state.local_cov.shape == (pipe.n_levels, 2, 2)
+    assert state.local_cov.cov.shape == (pipe.n_levels, 2, 2)
     for level in range(pipe.n_levels):
-        cov = state.local_cov[level]
+        cov = state.local_cov.cov[level]
         assert jnp.allclose(cov, cov.T, atol=1e-5)
         assert jnp.all(jnp.linalg.eigvalsh(cov) > -1e-5)
 
@@ -178,7 +182,7 @@ def test_lifted_jump_flips_at_hot_boundary():
     state = replace(state, directions=-jnp.ones(4, dtype=jnp.int32))
     # One jump attempt from the boundary downward → all should flip to +1, stay at 0.
     ctx = pipe._st_context()
-    sweep = pipe._sweep_inputs(state.flow_params, state.log_lambda, state.local_cov)
+    sweep = pipe._sweep_inputs(state.flow_params, state.log_lambda, state.local_cov.cov)
     keys = random.split(random.PRNGKey(2), 4)
 
     def one(k, x, level, direction):
@@ -200,14 +204,29 @@ def test_update_local_cov_estimates_correlation():
     x0 = jnp.concatenate([z, z], axis=-1)
     state = pipe.init_state(random.PRNGKey(1), x0)
     state = pipe.update_local_cov(state)
-    cov0 = state.local_cov[0]
+    cov0 = state.local_cov.cov[0]
     # Off-diagonal should be clearly positive (near 1 for this cloud).
     assert cov0[0, 1] > 0.5
-    # Empty levels stay I.
-    assert jnp.allclose(state.local_cov[1], jnp.eye(2), atol=1e-5)
+    assert jnp.isclose(state.local_cov.n[0], 64.0)
+    # Empty levels keep I and n=0.
+    assert jnp.allclose(state.local_cov.cov[1], jnp.eye(2), atol=1e-5)
+    assert jnp.isclose(state.local_cov.n[1], 0.0)
     # Non-identity Σ still runs implement.
     state = pipe.implement(state)
     assert state.x.shape == (64, 2)
+
+
+def test_update_local_cov_welford_accumulates_counts():
+    pipe = _tiny_pipeline(n_inner=2)
+    z = random.normal(random.PRNGKey(0), (32, 1))
+    x0 = jnp.concatenate([z, z], axis=-1)
+    state = pipe.init_state(random.PRNGKey(1), x0)
+    state = pipe.update_local_cov(state)
+    assert jnp.isclose(state.local_cov.n[0], 32.0)
+    # Same cloud again → n doubles; Σ stays near the same correlation.
+    state = pipe.update_local_cov(state)
+    assert jnp.isclose(state.local_cov.n[0], 64.0)
+    assert state.local_cov.cov[0, 0, 1] > 0.5
 
 
 def test_run_zero_iterations_returns_init_state():
