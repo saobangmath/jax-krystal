@@ -1,6 +1,9 @@
 """NICE: Nonlinear Independent Components Estimation (Dinh et al., 2014).
 
-Additive coupling layers are volume-preserving, so ``log|det J| = 0``.
+Additive coupling layers are volume-preserving. A final diagonal scaling
+``y = exp(log_s) ⊙ z`` provides the only nonzero contribution to
+``log|det J| = sum(log_s)``.
+
 Implemented with Flax ``nn.Module``; the public ``NICE`` wrapper keeps the
 ``Transformation`` API (``init`` / ``forward`` / ``inverse`` + params pytree).
 """
@@ -52,6 +55,8 @@ class NICEModule(nn.Module):
                 out_dim = split
             mlps.append(CouplingMLP(self.hidden_dims, out_dim))
         self.mlps = mlps
+        # Final diagonal scaling (NICE paper); parameterized as exp(log_s).
+        self.log_s = self.param("log_s", nn.initializers.zeros, (self.dim,))
 
     def __call__(self, x: Array) -> tuple[Array, Array]:
         split = _split_index(self.dim)
@@ -63,12 +68,20 @@ class NICEModule(nn.Module):
             else:
                 a = a + mlp(b)
             z = jnp.concatenate([a, b], axis=-1)
-        log_det = jnp.zeros(x.shape[:-1], dtype=x.dtype)
-        return z, log_det
+        scale = jnp.exp(self.log_s)
+        y = z * scale
+        log_det = jnp.broadcast_to(
+            jnp.sum(self.log_s), x.shape[:-1]
+        ).astype(x.dtype)
+        return y, log_det
 
     def inverse(self, y: Array) -> tuple[Array, Array]:
         split = _split_index(self.dim)
-        z = y
+        scale = jnp.exp(self.log_s)
+        z = y / scale
+        log_det = jnp.broadcast_to(
+            -jnp.sum(self.log_s), y.shape[:-1]
+        ).astype(y.dtype)
         for layer_idx in reversed(range(self.n_layers)):
             mlp = self.mlps[layer_idx]
             a, b = z[..., :split], z[..., split:]
@@ -77,7 +90,6 @@ class NICEModule(nn.Module):
             else:
                 a = a - mlp(b)
             z = jnp.concatenate([a, b], axis=-1)
-        log_det = jnp.zeros(y.shape[:-1], dtype=y.dtype)
         return z, log_det
 
 
@@ -107,9 +119,9 @@ class NICE:
         return self._module.init(key, dummy)["params"]
 
     def forward(self, params: object, x: Array) -> tuple[Array, Array]:
-        """Map ``x → y``; returns ``(y, log|det J|)`` with ``log|det J| = 0``."""
+        """Map ``x → y``; returns ``(y, log|det J|)`` from the final scaling."""
         return self._module.apply({"params": params}, x)
 
     def inverse(self, params: object, y: Array) -> tuple[Array, Array]:
-        """Map ``y → x`` via the exact inverse coupling."""
+        """Map ``y → x`` via scaling inverse then reverse couplings."""
         return self._module.apply({"params": params}, y, method=self._module.inverse)
